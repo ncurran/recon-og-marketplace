@@ -7,7 +7,7 @@ class Module(BaseModule):
     meta = {
         'name': 'Whois Data Miner',
         'author': 'Tim Tomes (@lanmaster53)',
-        'version': '1.1',
+        'version': '1.2',
         'description': 'Uses the ARIN Whois RWS to harvest companies, locations, netblocks, and contacts associated with the given company search string. Updates the respective tables with the results.',
         'comments': (
             'Wildcard searches are allowed using the "*" character.',
@@ -20,6 +20,7 @@ class Module(BaseModule):
 
     def module_run(self, searches):
         headers = {'Accept': 'application/json'}
+        #headers = {'Accept': 'application/arin.whoisrws-v1+json'}
         for search in searches:
             for rtype in ('org', 'customer'):
                 url = f"http://whois.arin.net/rest/{rtype}s;name={quote(search)}"
@@ -64,7 +65,7 @@ class Module(BaseModule):
         resp = self.request('GET', url, headers=headers)
         strs = [
             'No related resources were found for the handle provided.',
-            'Your search did not yield any results.'
+            'Sorry, there were no results.'
         ]
         if any(x in resp.text for x in strs) or ref not in resp.json()[grp]:
             self.output(f"No {grp.upper()} found.")
