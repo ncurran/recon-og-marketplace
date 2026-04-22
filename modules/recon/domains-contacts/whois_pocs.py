@@ -1,5 +1,4 @@
 from recon.core.module import BaseModule
-import pdb
 
 class Module(BaseModule):
 

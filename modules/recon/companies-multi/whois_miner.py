@@ -20,7 +20,6 @@ class Module(BaseModule):
 
     def module_run(self, searches):
         headers = {'Accept': 'application/json'}
-        #headers = {'Accept': 'application/arin.whoisrws-v1+json'}
         for search in searches:
             for rtype in ('org', 'customer'):
                 url = f"http://whois.arin.net/rest/{rtype}s;name={quote(search)}"
