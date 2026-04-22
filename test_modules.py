@@ -1,0 +1,1580 @@
+#!/usr/bin/env python3
+"""
+Test suite for recon-og-marketplace modules.
+
+Runs without a live recon-ng installation by injecting mock stubs into
+sys.modules before any marketplace module is loaded.
+
+Usage:
+    python3 test_modules.py
+    python3 test_modules.py TestCertificateTransparency
+"""
+
+import sys
+import os
+import json
+import importlib.util
+import unittest
+import time
+import tempfile
+from unittest.mock import MagicMock, patch
+
+# ── paths ──────────────────────────────────────────────────────────────────────
+_REPO = os.path.dirname(os.path.abspath(__file__))
+_MOD  = os.path.join(_REPO, 'modules')
+
+
+def _p(*parts):
+    return os.path.join(_MOD, *parts)
+
+
+# ── temp workspace shared across tests ────────────────────────────────────────
+_TMP = tempfile.mkdtemp(prefix='recon_test_')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Framework stubs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MockBaseModule:
+    """Minimal stand-in for recon.core.module.BaseModule."""
+    workspace = _TMP
+    data_path = _TMP
+
+    def __init__(self):
+        self.options    = {}
+        self.keys       = {}
+        self._hosts     = []
+        self._contacts  = []
+        self._companies = []
+        self._locations = []
+        self._netblocks = []
+        self._ports     = []
+        self._domains   = []
+        self._queries   = []
+        self._output    = []
+        self._errors    = []
+
+    # network ──────────────────────────────────────────────────────────────────
+    def request(self, method, url, **kw):
+        raise NotImplementedError('patch me')
+
+    # inserts ──────────────────────────────────────────────────────────────────
+    def insert_hosts(self, host=None, ip_address=None):
+        self._hosts.append({'host': host, 'ip_address': ip_address})
+
+    def insert_contacts(self, **kw):
+        self._contacts.append(kw)
+
+    def insert_companies(self, **kw):
+        self._companies.append(kw)
+
+    def insert_locations(self, **kw):
+        self._locations.append(kw)
+
+    def insert_netblocks(self, netblock=None):
+        self._netblocks.append(netblock)
+
+    def insert_ports(self, **kw):
+        self._ports.append(kw)
+
+    def insert_domains(self, domain=None):
+        self._domains.append(domain)
+
+    # DB ───────────────────────────────────────────────────────────────────────
+    def query(self, sql, values=None):
+        self._queries.append((sql, values))
+        return []
+
+    def get_columns(self, table):
+        defaults = {
+            'hosts':       [('host',), ('ip_address',)],
+            'contacts':    [('first_name',), ('last_name',), ('email',)],
+            'credentials': [('username',), ('password',)],
+        }
+        return defaults.get(table, [('id',)])
+
+    # output ───────────────────────────────────────────────────────────────────
+    def heading(self, text, level=0): pass
+    def verbose(self, text):          pass
+    def output(self, text):           self._output.append(str(text))
+    def error(self, text):            self._errors.append(str(text))
+    def alert(self, text):            self._output.append(f'ALERT:{text}')
+
+
+def _bootstrap():
+    """Inject mock recon framework into sys.modules before any module loads."""
+    mock_core_module = MagicMock()
+    mock_core_module.BaseModule = MockBaseModule
+
+    mock_utils_parsers = MagicMock()
+    mock_utils_parsers.parse_name = lambda name: (
+        name.split()[0] if name else None,
+        None,
+        name.split()[-1] if name and len(name.split()) > 1 else None,
+    )
+
+    entries = [
+        ('recon',               MagicMock()),
+        ('recon.core',          MagicMock()),
+        ('recon.core.module',   mock_core_module),
+        ('recon.utils',         MagicMock()),
+        ('recon.utils.parsers', mock_utils_parsers),
+    ]
+    for key, val in entries:
+        sys.modules.setdefault(key, val)
+
+
+_bootstrap()
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+def load_mod(filepath):
+    """Dynamically load a marketplace module file and return the module object."""
+    spec = importlib.util.spec_from_file_location('_rm', filepath)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class Resp:
+    """Lightweight mock HTTP response."""
+    def __init__(self, status=200, text='', data=None):
+        self.status_code = status
+        self.text = text
+        self._data = data if data is not None else {}
+
+    def json(self):
+        return self._data
+
+
+def _shodan_available():
+    try:
+        import shodan  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+_SKIP_SHODAN = unittest.skipUnless(_shodan_available(), 'shodan library not installed')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# certificate_transparency
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCertificateTransparency(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'certificate_transparency.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_happy_path_inserts_hosts(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data=[
+            {'name_value': 'mail.example.com'},
+            {'name_value': 'api.example.com'},
+        ])
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertIn('mail.example.com', hosts)
+        self.assertIn('api.example.com', hosts)
+
+    def test_email_in_name_value_inserts_contact(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data=[{'name_value': 'admin@example.com'}])
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 1)
+        self.assertEqual(inst._contacts[0]['email'], 'admin@example.com')
+        self.assertEqual(inst._hosts[0]['host'], 'example.com')
+
+    def test_non_200_skips_insert(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(status=500, text='error')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+
+    def test_empty_results_no_insert(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data=[])
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+
+    def test_multihost_name_value_all_inserted(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data=[
+            {'name_value': 'a.example.com\nb.example.com'}
+        ])
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertIn('a.example.com', hosts)
+        self.assertIn('b.example.com', hosts)
+
+    def test_multiple_domains_each_queried(self):
+        call_count = [0]
+        def mock_req(*a, **kw):
+            call_count[0] += 1
+            return Resp(data=[])
+        inst = self._inst()
+        inst.request = mock_req
+        inst.module_run(['alpha.com', 'beta.com'])
+        self.assertEqual(call_count[0], 2)
+
+    def test_null_name_value_skipped_gracefully(self):
+        """BUG: cert.get('name_value').split() raises AttributeError when
+        name_value is None — a cert entry with a null name should be skipped,
+        not crash the whole run. Currently crashes."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data=[
+            {'name_value': None},
+            {'name_value': 'api.example.com'},
+        ])
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 1)  # null entry skipped, valid one inserted
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# certspotter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCertspotter(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'certspotter.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def _cert(self, *dns_names, id='1'):
+        return {'id': id, 'dns_names': list(dns_names)}
+
+    def _one_page(self, *certs):
+        """Mock returning certs on the first call, then [] to stop pagination."""
+        calls = [0]
+        def _req(*a, **kw):
+            calls[0] += 1
+            return Resp(data=list(certs) if calls[0] == 1 else [])
+        return _req
+
+    def test_happy_path_inserts_hosts(self):
+        inst = self._inst()
+        inst.request = self._one_page(
+            self._cert('mail.example.com', id='1'),
+            self._cert('api.example.com',  id='2'),
+        )
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertIn('mail.example.com', hosts)
+        self.assertIn('api.example.com', hosts)
+
+    def test_multiple_dns_names_per_cert(self):
+        inst = self._inst()
+        inst.request = self._one_page(
+            self._cert('a.example.com', 'b.example.com', 'c.example.com', id='1'),
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 3)
+
+    def test_email_in_dns_names_inserts_contact(self):
+        inst = self._inst()
+        inst.request = self._one_page(self._cert('admin@example.com', id='1'))
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 1)
+        self.assertEqual(inst._contacts[0]['email'], 'admin@example.com')
+        self.assertEqual(inst._hosts[0]['host'], 'example.com')
+
+    def test_empty_response_stops_pagination(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data=[])
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+
+    def test_pagination_uses_last_id(self):
+        """Second request must include after=<id of last cert from first page>."""
+        calls = []
+        def mock_req(*a, **kw):
+            calls.append(kw.get('params', {}).copy())
+            return Resp(data=[self._cert('p1.example.com', id='42')] if len(calls) == 1 else [])
+        inst = self._inst()
+        inst.request = mock_req
+        inst.module_run(['example.com'])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].get('after'), '42')
+
+    def test_non_200_calls_error_and_stops(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(status=500, text='error')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+        self.assertTrue(len(inst._errors) > 0)
+
+    def test_rate_limit_429_calls_error_and_stops(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(status=429, text='Too Many Requests')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+        self.assertTrue(any('Rate limit' in e for e in inst._errors))
+
+    def test_null_dns_names_skipped_gracefully(self):
+        """Explicit None dns_names (absent expand) should not crash."""
+        inst = self._inst()
+        inst.request = self._one_page(
+            {'id': '1', 'dns_names': None},
+            {'id': '2', 'dns_names': ['ok.example.com']},
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['ok.example.com'])
+
+    def test_wildcard_entries_inserted_as_is(self):
+        inst = self._inst()
+        inst.request = self._one_page(self._cert('*.example.com', id='1'))
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts[0]['host'], '*.example.com')
+
+    def test_multiple_domains_each_queried(self):
+        call_count = [0]
+        def mock_req(*a, **kw):
+            call_count[0] += 1
+            return Resp(data=[])
+        inst = self._inst()
+        inst.request = mock_req
+        inst.module_run(['alpha.com', 'beta.com'])
+        self.assertEqual(call_count[0], 2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# hackertarget
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestHackerTarget(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'hackertarget.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_happy_path_two_hosts(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            text='sub1.example.com,1.2.3.4\nsub2.example.com,5.6.7.8'
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 2)
+        self.assertEqual(inst._hosts[0]['host'], 'sub1.example.com')
+        self.assertEqual(inst._hosts[0]['ip_address'], '1.2.3.4')
+
+    def test_non_200_calls_error(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(status=429, text='Too Many Requests')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+        self.assertTrue(len(inst._errors) > 0)
+
+    def test_empty_response_outputs_no_results(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+        self.assertTrue(any('No results' in o for o in inst._output))
+
+    def test_error_prefix_calls_error(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='error check your API usage')
+        inst.module_run(['example.com'])
+        self.assertTrue(len(inst._errors) > 0)
+
+    def test_blank_lines_skipped(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='sub.example.com,1.2.3.4\n\n')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 1)
+
+    def test_line_with_multiple_commas_skipped_gracefully(self):
+        """BUG: `host, address = line.split(",")` raises ValueError if a line
+        has more than one comma. The malformed line should be skipped and valid
+        lines should still be processed. Currently crashes the entire run."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            text='bad.example.com,1.2.3.4,extra\ngood.example.com,5.6.7.8'
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 1)  # bad line skipped, good line inserted
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# threatcrowd
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestThreatCrowd(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'threatcrowd.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_response_code_1_inserts_hosts(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data={
+            'response_code': '1',
+            'subdomains': ['a.example.com', 'b.example.com'],
+        })
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 2)
+        self.assertEqual(inst._hosts[0]['host'], 'a.example.com')
+
+    def test_response_code_0_no_insert(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data={'response_code': '0', 'subdomains': []})
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+
+    def test_missing_response_code_no_insert(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data={})
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+
+    def test_response_code_1_with_missing_subdomains_skipped_gracefully(self):
+        """BUG: `for subdomain in resp.json().get('subdomains')` raises TypeError
+        when the 'subdomains' key is absent (get() returns None). Should treat as
+        empty result. Currently crashes."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data={'response_code': '1'})
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# threatminer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestThreatMiner(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'threatminer.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_status_200_inserts_hosts(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data={
+            'status_code': '200',
+            'results': ['a.example.com', 'b.example.com'],
+        })
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 2)
+
+    def test_other_status_no_insert(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data={'status_code': '404', 'results': []})
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+
+    def test_status_200_with_missing_results_skipped_gracefully(self):
+        """BUG: `for subdomain in resp.json().get('results')` raises TypeError
+        when the 'results' key is absent (get() returns None). Should treat as
+        empty result. Currently crashes."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(data={'status_code': '200'})
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# mangle
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMangle(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'contacts-contacts', 'mangle.py'))
+
+    def _inst(self, **overrides):
+        inst = self.file.Module()
+        inst.options = {
+            'domain':     None,
+            'pattern':    '<fn>.<ln>',
+            'substitute': '-',
+            'max-length': 30,
+            'overwrite':  False,
+        }
+        inst.options.update(overrides)
+        return inst
+
+    # contacts rows: (rowid, first_name, middle_name, last_name, email)
+
+    def test_fn_ln_pattern_produces_correct_username(self):
+        inst = self._inst()
+        inst.module_run([(1, 'John', None, 'Doe', None)])
+        self.assertEqual(inst._queries[0][1][0], 'john.doe')
+
+    def test_domain_appended_when_set(self):
+        inst = self._inst(domain='example.com')
+        inst.module_run([(1, 'John', None, 'Doe', None)])
+        self.assertEqual(inst._queries[0][1][0], 'john.doe@example.com')
+
+    def test_overwrite_false_skips_existing_email(self):
+        inst = self._inst()
+        inst.module_run([(1, 'John', None, 'Doe', 'existing@x.com')])
+        self.assertEqual(len(inst._queries), 0)
+
+    def test_overwrite_true_updates_existing_email(self):
+        inst = self._inst(overwrite=True, domain='example.com')
+        inst.module_run([(1, 'John', None, 'Doe', 'existing@x.com')])
+        self.assertEqual(len(inst._queries), 1)
+
+    def test_max_length_truncation(self):
+        inst = self._inst(**{'max-length': 5})
+        inst.module_run([(1, 'Johnathan', None, 'Doeling', None)])
+        result = inst._queries[0][1][0]
+        self.assertLessEqual(len(result), 5)
+
+    def test_fi_ln_pattern(self):
+        inst = self._inst(pattern='<fi><ln>')
+        inst.module_run([(1, 'John', None, 'Doe', None)])
+        self.assertEqual(inst._queries[0][1][0], 'jdoe')
+
+    def test_spaces_in_name_replaced_by_substitute(self):
+        inst = self._inst(substitute='-')
+        inst.module_run([(1, 'Mary Jane', None, 'Watson', None)])
+        result = inst._queries[0][1][0]
+        self.assertIn('mary-jane', result)
+
+    def test_missing_first_name_handled_gracefully(self):
+        inst = self._inst(pattern='<fi><ln>')
+        inst.module_run([(1, None, None, 'Doe', None)])
+        # <fi> becomes '' when fname is None
+        result = inst._queries[0][1][0]
+        self.assertEqual(result, 'doe')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# unmangle
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestUnmangle(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            cls.file = load_mod(_p('recon', 'contacts-contacts', 'unmangle.py'))
+        except ImportError as e:
+            raise unittest.SkipTest(f'unmangle deps unavailable: {e}')
+
+    def _inst(self, **overrides):
+        inst = self.file.Module()
+        inst.options = {'pattern': '<fn>.<ln>', 'overwrite': False}
+        inst.options.update(overrides)
+        return inst
+
+    # contacts rows: (rowid, first_name, middle_name, last_name, email)
+
+    def test_fn_ln_pattern_extracts_names(self):
+        inst = self._inst()
+        inst.module_run([(1, None, None, None, 'john.doe@example.com')])
+        self.assertEqual(len(inst._queries), 1)
+        values = inst._queries[0][1]
+        self.assertIn('John', values)
+        self.assertIn('Doe', values)
+
+    def test_no_match_skips_contact(self):
+        inst = self._inst()
+        # No dot in username, so <fn>.<ln> pattern won't match
+        inst.module_run([(1, None, None, None, 'johndoe@example.com')])
+        self.assertEqual(len(inst._queries), 0)
+
+    def test_invalid_regex_calls_error_and_returns(self):
+        inst = self._inst(pattern='[invalid(regex')
+        inst.module_run([(1, None, None, None, 'john.doe@example.com')])
+        self.assertTrue(len(inst._errors) > 0)
+        self.assertEqual(len(inst._queries), 0)
+
+    def test_overwrite_false_preserves_existing_names(self):
+        inst = self._inst()
+        inst.module_run([(1, 'Existing', None, 'Name', 'john.doe@example.com')])
+        self.assertEqual(len(inst._queries), 0)
+
+    def test_overwrite_true_replaces_existing_names(self):
+        inst = self._inst(overwrite=True)
+        inst.module_run([(1, 'Existing', None, 'Name', 'john.doe@example.com')])
+        self.assertEqual(len(inst._queries), 1)
+
+    def test_custom_regex_with_named_groups(self):
+        inst = self._inst(pattern=r'(?P<first_name>\w+)_(?P<last_name>\w+)')
+        inst.module_run([(1, None, None, None, 'alice_smith@example.com')])
+        self.assertEqual(len(inst._queries), 1)
+        values = inst._queries[0][1]
+        self.assertIn('Alice', values)
+        self.assertIn('Smith', values)
+
+    def test_predefined_fn_ln_pattern_resolves(self):
+        inst = self._inst()
+        # Confirm predefined patterns table is populated
+        self.assertIn('<fn>.<ln>', self.file.Module.patterns)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# whois_pocs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestWhoisPocs(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-contacts', 'whois_pocs.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def _poc_data(self, email='alice@example.com'):
+        return {
+            'poc': {
+                'firstName': {'$': 'Alice'},
+                'lastName':  {'$': 'Smith'},
+                'emails':    {'email': {'$': email}},
+                'city':      {'$': 'Springfield'},
+                'iso3166-2': {'$': 'IL'},
+                'iso3166-1': {'name': {'$': 'United States'}},
+            }
+        }
+
+    def test_no_results_string_outputs_message(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='Sorry, there were no results.', data={})
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 0)
+        self.assertTrue(any('No contacts' in o for o in inst._output))
+
+    def test_single_poc_ref_dict_inserts_contact(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(*a, **kw):
+            if calls[0] == 0:
+                calls[0] += 1
+                return Resp(text='ok', data={'pocs': {'pocRef': {'@handle': 'ALICE-ARIN'}}})
+            return Resp(text='ok', data=self._poc_data())
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 1)
+        self.assertEqual(inst._contacts[0]['email'], 'alice@example.com')
+
+    def test_list_of_poc_refs_inserts_all(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(*a, **kw):
+            if calls[0] == 0:
+                calls[0] += 1
+                return Resp(text='ok', data={'pocs': {'pocRef': [
+                    {'@handle': 'A-ARIN'},
+                    {'@handle': 'B-ARIN'},
+                ]}})
+            return Resp(text='ok', data=self._poc_data())
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 2)
+
+    def test_email_domain_mismatch_skips_insert(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(*a, **kw):
+            if calls[0] == 0:
+                calls[0] += 1
+                return Resp(text='ok', data={'pocs': {'pocRef': {'@handle': 'X'}}})
+            return Resp(text='ok', data=self._poc_data(email='bob@otherdomain.com'))
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 0)
+
+    def test_no_first_name_handled(self):
+        """firstName is optional in ARIN POC records."""
+        inst = self._inst()
+        calls = [0]
+        poc_no_fname = {
+            'poc': {
+                'lastName':  {'$': 'Smith'},
+                'emails':    {'email': {'$': 'nofirst@example.com'}},
+                'city':      {'$': 'NYC'},
+                'iso3166-1': {'name': {'$': 'United States'}},
+            }
+        }
+        def _req(*a, **kw):
+            if calls[0] == 0:
+                calls[0] += 1
+                return Resp(text='ok', data={'pocs': {'pocRef': {'@handle': 'X'}}})
+            return Resp(text='ok', data=poc_no_fname)
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 1)
+        self.assertIsNone(inst._contacts[0]['first_name'])
+
+    def test_missing_last_name_skipped_gracefully(self):
+        """BUG: poc['lastName']['$'] has no guard (unlike firstName which checks
+        'if firstName in poc'). Raises KeyError if ARIN returns a POC without
+        lastName. Should skip the contact. Currently crashes."""
+        inst = self._inst()
+        calls = [0]
+        poc_no_lname = {
+            'poc': {
+                'firstName': {'$': 'John'},
+                'emails':    {'email': {'$': 'jdoe@example.com'}},
+                'city':      {'$': 'NYC'},
+                'iso3166-1': {'name': {'$': 'United States'}},
+                # no 'lastName' key
+            }
+        }
+        def _req(*a, **kw):
+            if calls[0] == 0:
+                calls[0] += 1
+                return Resp(text='ok', data={'pocs': {'pocRef': {'@handle': 'X'}}})
+            return Resp(text='ok', data=poc_no_lname)
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 0)  # incomplete POC skipped
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# whois_miner (companies-multi)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestWhoisMiner(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'companies-multi', 'whois_miner.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_enum_ref_with_list_returns_list(self):
+        result = self.file._enum_ref([{'a': 1}, {'b': 2}])
+        self.assertEqual(result, [{'a': 1}, {'b': 2}])
+
+    def test_enum_ref_with_single_dict_wraps_in_list(self):
+        result = self.file._enum_ref({'a': 1})
+        self.assertEqual(result, [{'a': 1}])
+
+    def test_whois_location_parses_full_object(self):
+        obj = {
+            'streetAddress': {'line': {'$': '123 Main St'}},
+            'city':          {'$': 'springfield'},
+            'iso3166-2':     {'$': 'il'},
+            'postalCode':    {'$': '62701'},
+            'iso3166-1':     {'name': {'$': 'united states'}},
+        }
+        loc = self.file.WhoisLocation(obj)
+        self.assertEqual(loc.city, 'Springfield')
+        self.assertEqual(loc.state, 'IL')
+        self.assertEqual(loc.postal_code, '62701')
+        self.assertIn('Main St', loc.address)
+        self.assertIn('United States', loc.address)
+
+    def test_whois_location_optional_fields_absent(self):
+        obj = {
+            'city':      {'$': 'London'},
+            'iso3166-1': {'name': {'$': 'United Kingdom'}},
+        }
+        loc = self.file.WhoisLocation(obj)
+        self.assertIsNone(loc.street_address)
+        self.assertIsNone(loc.state)
+        self.assertEqual(loc.country, 'United Kingdom')
+
+    def test_street_address_as_empty_list_skipped_gracefully(self):
+        """BUG: _enum_ref(obj['streetAddress']['line'])[-1] raises IndexError
+        if 'line' is an empty list. ARIN occasionally returns streetAddress with
+        an empty line array. Should treat as no street address. Currently crashes."""
+        obj = {
+            'streetAddress': {'line': []},
+            'city':          {'$': 'Boston'},
+            'iso3166-1':     {'name': {'$': 'United States'}},
+        }
+        loc = self.file.WhoisLocation(obj)
+        self.assertIsNone(loc.street_address)
+
+    def test_no_results_string_skips_entity(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            text='Sorry, there were no results.',
+            data={'orgs': {}, 'customers': {}}
+        )
+        inst.module_run(['TestCorp'])
+        self.assertEqual(len(inst._companies), 0)
+
+    def test_happy_path_full_flow(self):
+        """
+        Exercises the full org → entity detail → nets → pocs chain.
+        Call sequence for one org entity:
+          0: org search (_request)
+          1: entity detail (direct request)
+          2: nets (_request)
+          3: pocs (_request)
+          4: POC detail (direct request)
+          5: customer search (_request) → no results
+        """
+        inst = self._inst()
+        calls = [0]
+
+        def _req(*a, **kw):
+            c = calls[0]
+            calls[0] += 1
+            if c == 0:   # org search
+                return Resp(text='ok', data={'orgs': {'orgRef': [{
+                    '@name': 'Example Corp',
+                    '@handle': 'EXAMPLECORP',
+                    '$': 'https://whois.arin.net/rest/org/EXAMPLECORP',
+                }]}})
+            elif c == 1: # entity detail
+                return Resp(text='ok', data={'org': {
+                    'streetAddress': {'line': {'$': '1 Main St'}},
+                    'city':          {'$': 'Boston'},
+                    'iso3166-1':     {'name': {'$': 'United States'}},
+                }})
+            elif c == 2: # nets
+                return Resp(text='ok', data={'nets': {'netRef': [{
+                    '@startAddress': '1.2.3.0',
+                    '@endAddress':   '1.2.3.255',
+                }]}})
+            elif c == 3: # pocs
+                return Resp(text='ok', data={'pocs': {'pocLinkRef': [{
+                    '$':             'https://whois.arin.net/rest/poc/JDOE',
+                    '@description':  'Tech',
+                }]}})
+            elif c == 4: # POC detail
+                return Resp(text='ok', data={'poc': {
+                    'firstName': {'$': 'John'},
+                    'lastName':  {'$': 'Doe'},
+                    'emails':    {'email': {'$': 'jdoe@example.com'}},
+                    'city':      {'$': 'Boston'},
+                    'iso3166-1': {'name': {'$': 'United States'}},
+                }})
+            # customer search → no results
+            return Resp(text='Sorry, there were no results.', data={'customers': {}})
+
+        inst.request = _req
+        inst.module_run(['TestCorp'])
+
+        self.assertEqual(len(inst._companies), 1)
+        self.assertEqual(inst._companies[0]['company'], 'Example Corp')
+        self.assertEqual(len(inst._locations), 1)
+        self.assertIn('Main St', inst._locations[0]['street_address'])
+        self.assertEqual(len(inst._netblocks), 1)
+        self.assertEqual(inst._netblocks[0], '1.2.3.0/24')
+        self.assertEqual(len(inst._contacts), 1)
+        self.assertEqual(inst._contacts[0]['email'], 'jdoe@example.com')
+        self.assertEqual(inst._contacts[0]['first_name'], 'John')
+        self.assertEqual(inst._contacts[0]['last_name'], 'Doe')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# whois_orgs (netblocks-companies)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestWhoisOrgs(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'netblocks-companies', 'whois_orgs.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_no_record_found_outputs_message_and_no_insert(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            text='No record found for the handle provided.',
+            data={'net': {}}
+        )
+        inst.module_run(['192.168.1.0/24'])
+        self.assertEqual(len(inst._companies), 0)
+        self.assertTrue(any('No companies' in o for o in inst._output))
+
+    def test_orgref_present_inserts_company(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            text='ok',
+            data={'net': {
+                'orgRef': {'@name': 'Example Corp', '$': 'https://whois.arin.net/rest/org/EX'}
+            }}
+        )
+        inst.module_run(['192.168.1.0/24'])
+        # module issues 2 URLs (cidr + ip), each returning an orgRef
+        self.assertEqual(len(inst._companies), 2)
+        self.assertEqual(inst._companies[0]['company'], 'Example Corp')
+
+    def test_no_ref_in_net_no_insert(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='ok', data={'net': {}})
+        inst.module_run(['10.0.0.0/8'])
+        self.assertEqual(len(inst._companies), 0)
+
+    def test_customer_ref_also_handled(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            text='ok',
+            data={'net': {
+                'customerRef': {'@name': 'Acme Inc', '$': 'https://whois.arin.net/rest/customer/AC'}
+            }}
+        )
+        inst.module_run(['1.2.3.0/24'])
+        self.assertTrue(len(inst._companies) > 0)
+        self.assertEqual(inst._companies[0]['company'], 'Acme Inc')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# nmap XML importer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNmapImporter(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('import', 'nmap.py'))
+
+    def _write_xml(self, xml_str):
+        f = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.xml', delete=False, dir=_TMP
+        )
+        f.write(xml_str)
+        f.close()
+        return f.name
+
+    def test_hostname_and_open_port_all_inserted(self):
+        fname = self._write_xml('''<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="1.2.3.4"/>
+    <hostnames><hostname name="host.example.com"/></hostnames>
+    <ports>
+      <port protocol="tcp" portid="443">
+        <state state="open"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>''')
+        inst = self.file.Module()
+        inst.options = {'filename': fname}
+        inst.module_run()
+        self.assertIn('host.example.com', inst._domains)
+        self.assertEqual(inst._hosts[0]['host'], 'host.example.com')
+        self.assertEqual(inst._hosts[0]['ip_address'], '1.2.3.4')
+        self.assertEqual(inst._ports[0]['port'], '443')
+        self.assertEqual(inst._ports[0]['protocol'], 'tcp')
+
+    def test_no_hostname_inserts_ip_only(self):
+        fname = self._write_xml('''<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="5.6.7.8"/>
+  </host>
+</nmaprun>''')
+        inst = self.file.Module()
+        inst.options = {'filename': fname}
+        inst.module_run()
+        self.assertEqual(len(inst._hosts), 1)
+        self.assertIsNone(inst._hosts[0]['host'])
+        self.assertEqual(inst._hosts[0]['ip_address'], '5.6.7.8')
+
+    def test_closed_port_not_inserted(self):
+        fname = self._write_xml('''<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="1.2.3.4"/>
+    <ports>
+      <port protocol="tcp" portid="22"><state state="open"/></port>
+      <port protocol="tcp" portid="80"><state state="closed"/></port>
+    </ports>
+  </host>
+</nmaprun>''')
+        inst = self.file.Module()
+        inst.options = {'filename': fname}
+        inst.module_run()
+        self.assertEqual(len(inst._ports), 1)
+        self.assertEqual(inst._ports[0]['port'], '22')
+
+    def test_no_ports_section_no_crash(self):
+        fname = self._write_xml('''<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="9.9.9.9"/>
+    <hostnames><hostname name="dns.example.com"/></hostnames>
+  </host>
+</nmaprun>''')
+        inst = self.file.Module()
+        inst.options = {'filename': fname}
+        inst.module_run()
+        self.assertEqual(len(inst._hosts), 1)
+        self.assertEqual(len(inst._ports), 0)
+
+    def test_multiple_hosts_all_processed(self):
+        fname = self._write_xml('''<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="1.1.1.1"/>
+    <hostnames><hostname name="one.example.com"/></hostnames>
+  </host>
+  <host>
+    <address addr="2.2.2.2"/>
+    <hostnames><hostname name="two.example.com"/></hostnames>
+  </host>
+</nmaprun>''')
+        inst = self.file.Module()
+        inst.options = {'filename': fname}
+        inst.module_run()
+        self.assertEqual(len(inst._hosts), 2)
+
+    def test_port_without_state_element_skips_only_bad_port(self):
+        """BUG: host_port.find('state').get('state') raises AttributeError when
+        <state> element is absent. The outer `except AttributeError: pass` was
+        meant to handle a missing <ports> element, but it also catches this
+        error — so ALL subsequent ports are silently lost too. A valid open port
+        after a malformed one should still be inserted. Currently it is not."""
+        fname = self._write_xml('''<?xml version="1.0"?>
+<nmaprun>
+  <host>
+    <address addr="1.2.3.4"/>
+    <ports>
+      <port protocol="tcp" portid="80"/>
+      <port protocol="tcp" portid="443"><state state="open"/></port>
+    </ports>
+  </host>
+</nmaprun>''')
+        inst = self.file.Module()
+        inst.options = {'filename': fname}
+        inst.module_run()
+        # Port 80 has no <state> so it should be skipped.
+        # Port 443 is valid and open — it should be inserted.
+        # Currently 0 ports are inserted because the loop exits on the first error.
+        self.assertEqual(len(inst._ports), 1)
+        self.assertEqual(inst._ports[0]['port'], '443')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# pgp_search
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPgpSearch(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-contacts', 'pgp_search.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_happy_path_inserts_contact(self):
+        inst = self._inst()
+        # pgp_search splits on [\n<>] and matches ^(.*)&lt;(.*)&gt;$
+        inst.request = lambda *a, **kw: Resp(
+            text='John Smith &lt;john.smith@example.com&gt;'
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 1)
+        self.assertEqual(inst._contacts[0]['email'], 'john.smith@example.com')
+
+    def test_no_matching_lines_outputs_no_results(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='<html>no pgp keys found</html>')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 0)
+        self.assertTrue(any('No results' in o for o in inst._output))
+
+    def test_email_domain_mismatch_not_inserted(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            text='Bob Jones &lt;bob@otherdomain.com&gt;'
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 0)
+
+    def test_parenthesized_comment_stripped(self):
+        """Names like 'Alice (Work) &lt;alice@example.com&gt;' are handled."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            text='Alice (Work Account) &lt;alice@example.com&gt;'
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 1)
+
+    def test_deduplication_of_results(self):
+        inst = self._inst()
+        # Same entry repeated on two lines
+        line = 'Jane Doe &lt;jane@example.com&gt;'
+        inst.request = lambda *a, **kw: Resp(text=f'{line}\n{line}')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._contacts), 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# reporting/json
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestReportingJson(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('reporting', 'json.py'))
+
+    def test_writes_valid_json_file(self):
+        outfile = os.path.join(_TMP, 'rpt_test.json')
+        inst = self.file.Module()
+        inst.options = {'tables': 'hosts', 'filename': outfile}
+        inst.get_columns = lambda t: [('host',), ('ip_address',)]
+        inst.query      = lambda sql, v=None: [('host.example.com', '1.2.3.4')]
+        inst.module_run()
+        self.assertTrue(os.path.exists(outfile))
+        with open(outfile) as f:
+            data = json.load(f)
+        self.assertIn('hosts', data)
+        self.assertEqual(data['hosts'][0]['host'], 'host.example.com')
+        self.assertEqual(data['hosts'][0]['ip_address'], '1.2.3.4')
+
+    def test_output_message_contains_record_count(self):
+        outfile = os.path.join(_TMP, 'rpt_count.json')
+        inst = self.file.Module()
+        inst.options = {'tables': 'hosts', 'filename': outfile}
+        inst.get_columns = lambda t: [('host',)]
+        inst.query      = lambda sql, v=None: [('a.com',), ('b.com',)]
+        inst.module_run()
+        self.assertTrue(any('2' in o for o in inst._output))
+
+    def test_multiple_tables_merged_into_one_file(self):
+        outfile = os.path.join(_TMP, 'rpt_multi.json')
+        inst = self.file.Module()
+        inst.options = {'tables': 'hosts, contacts', 'filename': outfile}
+        inst.get_columns = lambda t: [('id',)]
+        inst.query      = lambda sql, v=None: [('row1',)]
+        inst.module_run()
+        with open(outfile) as f:
+            data = json.load(f)
+        self.assertIn('hosts', data)
+        self.assertIn('contacts', data)
+
+    def test_empty_table_writes_empty_list(self):
+        outfile = os.path.join(_TMP, 'rpt_empty.json')
+        inst = self.file.Module()
+        inst.options = {'tables': 'hosts', 'filename': outfile}
+        inst.get_columns = lambda t: [('host',)]
+        inst.query      = lambda sql, v=None: []
+        inst.module_run()
+        with open(outfile) as f:
+            data = json.load(f)
+        self.assertEqual(data['hosts'], [])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# reporting/csv
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestReportingCsv(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('reporting', 'csv.py'))
+
+    def test_writes_csv_rows(self):
+        outfile = os.path.join(_TMP, 'rpt_rows.csv')
+        inst = self.file.Module()
+        inst.options = {'table': 'hosts', 'filename': outfile, 'headers': False}
+        inst.get_columns = lambda t: [('host',), ('ip_address',)]
+        inst.query      = lambda sql, v=None: [('host.example.com', '1.2.3.4')]
+        inst.module_run()
+        self.assertTrue(os.path.exists(outfile))
+        with open(outfile) as f:
+            content = f.read()
+        self.assertIn('host.example.com', content)
+        self.assertIn('1.2.3.4', content)
+
+    def test_csv_injection_at_symbol_prefixed(self):
+        outfile = os.path.join(_TMP, 'rpt_inj.csv')
+        inst = self.file.Module()
+        inst.options = {'table': 'hosts', 'filename': outfile, 'headers': False}
+        inst.get_columns = lambda t: [('host',)]
+        inst.query      = lambda sql, v=None: [('@evil.formula',)]
+        inst.module_run()
+        with open(outfile) as f:
+            content = f.read()
+        self.assertIn(' @evil.formula', content)
+
+    def test_csv_injection_dash_prefixed(self):
+        outfile = os.path.join(_TMP, 'rpt_dash.csv')
+        inst = self.file.Module()
+        inst.options = {'table': 'hosts', 'filename': outfile, 'headers': False}
+        inst.get_columns = lambda t: [('host',)]
+        inst.query      = lambda sql, v=None: [('-1+1',)]
+        inst.module_run()
+        with open(outfile) as f:
+            content = f.read()
+        self.assertIn(' -1+1', content)
+
+    def test_headers_written_when_enabled(self):
+        outfile = os.path.join(_TMP, 'rpt_hdr.csv')
+        inst = self.file.Module()
+        inst.options = {'table': 'hosts', 'filename': outfile, 'headers': True}
+        inst.get_columns = lambda t: [('host',), ('ip_address',)]
+        inst.query      = lambda sql, v=None: []
+        inst.module_run()
+        with open(outfile) as f:
+            first_line = f.readline()
+        self.assertIn('host', first_line)
+        self.assertIn('ip_address', first_line)
+
+    def test_integer_cell_handled_gracefully(self):
+        """BUG: `if cell and cell[0] in badcharacters` assumes cell is a string.
+        SQLite can return integers (e.g. a port number column). cell[0] on an int
+        raises TypeError. Should coerce to string first. Currently crashes."""
+        outfile = os.path.join(_TMP, 'rpt_int.csv')
+        inst = self.file.Module()
+        inst.options = {'table': 'ports', 'filename': outfile, 'headers': False}
+        inst.get_columns = lambda t: [('port',)]
+        inst.query      = lambda sql, v=None: [(443,)]  # integer, not string
+        inst.module_run()
+        with open(outfile) as f:
+            content = f.read()
+        self.assertIn('443', content)
+
+    def test_record_count_in_output(self):
+        outfile = os.path.join(_TMP, 'rpt_cnt.csv')
+        inst = self.file.Module()
+        inst.options = {'table': 'hosts', 'filename': outfile, 'headers': False}
+        inst.get_columns = lambda t: [('host',)]
+        inst.query      = lambda sql, v=None: [('a.com',), ('b.com',), ('c.com',)]
+        inst.module_run()
+        self.assertTrue(any('3' in o for o in inst._output))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# adobe (known Python 2 incompatibility)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAdobe(unittest.TestCase):
+    """
+    adobe.py uses str.decode('base64') which is Python 2 syntax — the entire
+    module is incompatible with Python 3. The test below asserts what SHOULD
+    happen (crack a known hash), but is decorated @expectedFailure because the
+    module cannot be called at all under Python 3. If the module is ever ported,
+    remove the decorator and update the assertion.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'credentials-credentials', 'adobe.py'))
+        cls.block_db = os.path.join(_TMP, 'adobe_blocks.json')
+        with open(cls.block_db, 'w') as f:
+            json.dump({}, f)
+
+    @unittest.expectedFailure
+    def test_module_run_processes_hashes(self):
+        """module_run should process hashes without crashing (Python 3 port needed)."""
+        inst = self.file.Module()
+        inst.options = {'source': 'default', 'block_db': self.block_db}
+        inst.module_run([b'dGVzdA=='])  # raises AttributeError/LookupError in Python 3
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shodan modules (mocked API — zero real network calls)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@_SKIP_SHODAN
+class TestShodanOrg(unittest.TestCase):
+    """shodan_org.py — searches by org: operator."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'companies-multi', 'shodan_org.py'))
+
+    def _inst(self):
+        inst = self.file.Module()
+        inst.options = {'limit': 0}
+        inst.keys    = {'shodan_api': 'test_key'}
+        return inst
+
+    def _single_result(self, **extra):
+        base = {'ip_str': '1.2.3.4', 'port': 443, 'transport': 'tcp'}
+        base.update(extra)
+        return {'total': 1, 'matches': [base]}
+
+    def test_host_with_hostname_inserts_host_and_port(self):
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.search.return_value = self._single_result(
+                hostnames=['host.example.com']
+            )
+            inst.module_run(['Example Corp'])
+        self.assertEqual(len(inst._hosts), 1)
+        self.assertEqual(inst._hosts[0]['host'], 'host.example.com')
+        self.assertEqual(len(inst._ports), 1)
+        self.assertEqual(inst._ports[0]['port'], 443)
+
+    def test_missing_hostnames_key_inserts_port_with_ip(self):
+        """BUG: except KeyError block references undefined 'ipaddr' (should be
+        port['ip_str']), causing NameError. A match with no 'hostnames' key
+        should fall back to inserting by IP only. Currently crashes."""
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.search.return_value = self._single_result()
+            inst.module_run(['Example Corp'])
+        self.assertEqual(len(inst._ports), 1)
+        self.assertEqual(inst._ports[0]['ip_address'], '1.2.3.4')
+
+    def test_empty_result_set_no_inserts(self):
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.search.return_value = {'total': 0, 'matches': []}
+            inst.module_run(['Example Corp'])
+        self.assertEqual(len(inst._hosts), 0)
+        self.assertEqual(len(inst._ports), 0)
+
+
+@_SKIP_SHODAN
+class TestShodanNet(unittest.TestCase):
+    """shodan_net.py — searches by net: operator, no undefined-variable bug."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'netblocks-hosts', 'shodan_net.py'))
+
+    def _inst(self):
+        inst = self.file.Module()
+        inst.options = {'limit': 0}
+        inst.keys    = {'shodan_api': 'test_key'}
+        return inst
+
+    def _single_result(self, **extra):
+        base = {'ip_str': '192.168.1.1', 'port': 22, 'transport': 'tcp', 'hostnames': []}
+        base.update(extra)
+        return {'total': 1, 'matches': [base]}
+
+    def test_host_with_hostname_inserts_hostname_and_port(self):
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.search.return_value = self._single_result(
+                hostnames=['router.example.com']
+            )
+            inst.module_run(['192.168.1.0/24'])
+        self.assertEqual(inst._hosts[0]['host'], 'router.example.com')
+        self.assertEqual(inst._ports[0]['host'], 'router.example.com')
+
+    def test_host_without_hostname_inserts_ip_only(self):
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.search.return_value = self._single_result(hostnames=[])
+            inst.module_run(['10.0.0.0/8'])
+        self.assertIsNone(inst._hosts[0]['host'])
+        self.assertEqual(inst._hosts[0]['ip_address'], '192.168.1.1')
+        # Port inserted with ip_address only
+        self.assertNotIn('host', inst._ports[0])
+
+
+@_SKIP_SHODAN
+class TestShodanIp(unittest.TestCase):
+    """shodan_ip.py — uses api.host() not api.search()."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'hosts-ports', 'shodan_ip.py'))
+
+    def _inst(self):
+        inst = self.file.Module()
+        inst.options = {'limit': 0}
+        inst.keys    = {'shodan_api': 'test_key'}
+        return inst
+
+    def test_host_with_hostnames_inserts_ports(self):
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.host.return_value = {
+                'data': [{'hostnames': ['host.example.com'], 'port': 443, 'transport': 'tcp'}]
+            }
+            inst.module_run(['1.2.3.4'])
+        self.assertEqual(len(inst._ports), 1)
+        self.assertEqual(inst._ports[0]['host'], 'host.example.com')
+        self.assertEqual(inst._ports[0]['port'], 443)
+
+    def test_host_without_hostnames_key_falls_to_except(self):
+        """Missing 'hostnames' key → KeyError → insert_ports with ip only (no bug here)."""
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.host.return_value = {
+                'data': [{'port': 80, 'transport': 'tcp'}]
+            }
+            inst.module_run(['1.2.3.4'])
+        self.assertEqual(len(inst._ports), 1)
+        self.assertEqual(inst._ports[0]['ip_address'], '1.2.3.4')
+
+    def test_api_error_suppressed(self):
+        import shodan
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.host.side_effect = shodan.exception.APIError('No info')
+            inst.module_run(['9.9.9.9'])
+        self.assertEqual(len(inst._ports), 0)
+
+
+@_SKIP_SHODAN
+class TestShodanHostname(unittest.TestCase):
+    """
+    shodan_hostname.py — searches by hostname: operator.
+    Contains two known bugs: undefined 'ipaddr' and self.insert_host() typo.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'shodan_hostname.py'))
+
+    def _inst(self):
+        inst = self.file.Module()
+        inst.options = {'limit': 0}
+        inst.keys    = {'shodan_api': 'test_key'}
+        return inst
+
+    def test_host_with_hostnames_inserts_correctly(self):
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.search.return_value = {
+                'total': 1,
+                'matches': [{'ip_str': '1.2.3.4', 'port': 443, 'transport': 'tcp',
+                             'hostnames': ['host.example.com']}]
+            }
+            inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 1)
+        self.assertEqual(inst._hosts[0]['host'], 'host.example.com')
+
+    def test_missing_hostnames_key_inserts_port_with_ip(self):
+        """BUG: except KeyError block references undefined 'ipaddr' (NameError)
+        and calls self.insert_host() instead of self.insert_hosts() (AttributeError).
+        A match with no 'hostnames' key should fall back to inserting by IP only.
+        Currently crashes on both counts."""
+        inst = self._inst()
+        with patch('shodan.Shodan') as MockShodan:
+            MockShodan.return_value.search.return_value = {
+                'total': 1,
+                'matches': [{'ip_str': '1.2.3.4', 'port': 80, 'transport': 'tcp'}]
+            }
+            inst.module_run(['example.com'])
+        self.assertEqual(len(inst._ports), 1)
+        self.assertEqual(inst._ports[0]['ip_address'], '1.2.3.4')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Pretty runner
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _PrettyResult(unittest.TestResult):
+    PASS  = '✓'
+    FAIL  = '✗'
+    SKIP  = '○'
+    ERROR = '⚠'
+
+    def __init__(self, stream):
+        super().__init__()
+        self.stream   = stream
+        self._start   = {}
+        self._seen    = set()
+
+    def _suite(self, test):
+        return type(test).__name__
+
+    def _label(self, test):
+        return test._testMethodName.replace('test_', '', 1).replace('_', ' ')
+
+    def _print_suite_header(self, test):
+        name = self._suite(test)
+        if name not in self._seen:
+            self._seen.add(name)
+            display = name.replace('Test', '', 1)
+            self.stream.write(f'\n  {display}\n')
+
+    def startTest(self, test):
+        super().startTest(test)
+        self._print_suite_header(test)
+        self._start[test.id()] = time.perf_counter()
+
+    def _elapsed(self, test):
+        return time.perf_counter() - self._start.get(test.id(), time.perf_counter())
+
+    def addSuccess(self, test):
+        t = self._elapsed(test)
+        self.stream.write(f'    {self.PASS}  {self._label(test):<56} {t:.3f}s\n')
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        t = self._elapsed(test)
+        msg = str(err[1]).splitlines()[0][:64]
+        self.stream.write(f'    {self.FAIL}  {self._label(test):<56} {t:.3f}s\n')
+        self.stream.write(f'       └─ {msg}\n')
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        t = self._elapsed(test)
+        msg = str(err[1]).splitlines()[0][:64]
+        self.stream.write(f'    {self.ERROR}  {self._label(test):<56} {t:.3f}s\n')
+        self.stream.write(f'       └─ {msg}\n')
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        self.stream.write(f'    {self.SKIP}  {self._label(test):<56} skipped\n')
+        self.stream.write(f'       └─ {reason[:64]}\n')
+
+    def addExpectedFailure(self, test, err):
+        super().addExpectedFailure(test, err)
+        self.stream.write(f'    {self.PASS}  {self._label(test):<56} xfail\n')
+
+    def addUnexpectedSuccess(self, test):
+        super().addUnexpectedSuccess(test)
+        self.stream.write(f'    {self.FAIL}  {self._label(test):<56} unexpected pass\n')
+
+
+class _PrettyRunner:
+    WIDTH = 76
+
+    def run(self, suite):
+        s = sys.stdout
+        bar = '═' * self.WIDTH
+        title = ' recon-og-marketplace — module test suite '
+        pad_l = (self.WIDTH - len(title)) // 2
+        pad_r = self.WIDTH - len(title) - pad_l
+
+        s.write('╔' + '═' * self.WIDTH + '╗\n')
+        s.write('║' + ' ' * pad_l + title + ' ' * pad_r + '║\n')
+        s.write('╚' + '═' * self.WIDTH + '╝\n')
+
+        result = _PrettyResult(s)
+        t0     = time.perf_counter()
+        suite.run(result)
+        elapsed = time.perf_counter() - t0
+
+        passed  = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
+        s.write(f'\n{bar}\n')
+        s.write(
+            f'  passed: {passed}   failed: {len(result.failures)}'
+            f'   errors: {len(result.errors)}   skipped: {len(result.skipped)}'
+            f'   total: {result.testsRun}   time: {elapsed:.3f}s\n'
+        )
+        s.write(f'{bar}\n')
+
+        if result.failures or result.errors:
+            s.write('\nfailure details:\n')
+            for test, tb in result.failures + result.errors:
+                s.write(f'\n  — {test.id()}\n')
+                for line in tb.splitlines()[-8:]:
+                    s.write(f'    {line}\n')
+
+        return result
+
+
+if __name__ == '__main__':
+    loader = unittest.TestLoader()
+    suite  = loader.loadTestsFromModule(sys.modules[__name__])
+    result = _PrettyRunner().run(suite)
+    sys.exit(0 if result.wasSuccessful() else 1)
