@@ -1390,6 +1390,170 @@ class TestShodanHostname(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# asn_lookup
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAsnLookup(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'companies-netblocks', 'asn_lookup.py'))
+
+    def _inst(self, api_key=None):
+        inst = self.file.Module()
+        inst.keys = {'hackertarget_api': api_key} if api_key else {}
+        return inst
+
+    # HackerTarget response for a company search: list of "ASNNUM","NAME" lines
+    def _asn_search_resp(self, *entries):
+        lines = '\n'.join(f'"{num}","{name}"' for num, name in entries)
+        return Resp(text=lines)
+
+    # HackerTarget response for a prefix lookup: ASN descriptor line + CIDR lines
+    def _prefix_resp(self, asn_num, asn_name, *prefixes):
+        lines = [f'"{asn_num}","{asn_name}"'] + list(prefixes)
+        return Resp(text='\n'.join(lines))
+
+    def test_happy_path_inserts_prefixes(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(method, url, params=None, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                return self._asn_search_resp(('15169', 'GOOGLE, US'))
+            return self._prefix_resp('15169', 'GOOGLE, US', '8.8.8.0/24', '8.8.4.0/24')
+        inst.request = _req
+        inst.module_run(['Google'])
+        self.assertEqual(inst._netblocks, ['8.8.8.0/24', '8.8.4.0/24'])
+
+    def test_no_matching_asn_outputs_message(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._asn_search_resp(('99999', 'UNRELATED-ORG, DE'))
+        inst.module_run(['Google'])
+        self.assertEqual(inst._netblocks, [])
+        self.assertTrue(any('No ASNs matched' in o for o in inst._output))
+
+    def test_api_error_text_outputs_message(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='error check your query')
+        inst.module_run(['Google'])
+        self.assertEqual(inst._netblocks, [])
+        self.assertTrue(any('No ASNs found' in o for o in inst._output))
+
+    def test_429_on_search_breaks_loop(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(status=429)
+        inst.module_run(['Google', 'Amazon'])
+        self.assertTrue(any('Rate limit' in e for e in inst._errors))
+        self.assertEqual(inst._netblocks, [])
+
+    def test_429_on_prefix_fetch_returns_early(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(method, url, params=None, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                return self._asn_search_resp(('15169', 'GOOGLE, US'))
+            return Resp(status=429)
+        inst.request = _req
+        inst.module_run(['Google'])
+        self.assertTrue(any('Rate limit' in e for e in inst._errors))
+        self.assertEqual(inst._netblocks, [])
+
+    def test_non_200_search_response_continues(self):
+        inst = self._inst()
+        results = [Resp(status=503), self._asn_search_resp(('15169', 'GOOGLE, US'))]
+        idx = [0]
+        def _req(*a, **kw):
+            r = results[min(idx[0], len(results) - 1)]
+            idx[0] += 1
+            return r
+        inst.request = _req
+        inst.module_run(['Google', 'Google'])
+        self.assertTrue(any('Unexpected response' in e for e in inst._errors))
+
+    def test_api_key_included_in_params(self):
+        inst = self._inst(api_key='mykey123')
+        captured = []
+        def _req(method, url, params=None, **kw):
+            captured.append(params or {})
+            return self._asn_search_resp(('15169', 'GOOGLE, US')) if len(captured) == 1 \
+                else self._prefix_resp('15169', 'GOOGLE, US', '8.8.8.0/24')
+        inst.request = _req
+        inst.module_run(['Google'])
+        self.assertTrue(all(p.get('apikey') == 'mykey123' for p in captured))
+
+    def test_no_api_key_omits_param(self):
+        inst = self._inst()
+        captured = []
+        def _req(method, url, params=None, **kw):
+            captured.append(params or {})
+            return self._asn_search_resp(('15169', 'GOOGLE, US')) if len(captured) == 1 \
+                else self._prefix_resp('15169', 'GOOGLE, US', '8.8.8.0/24')
+        inst.request = _req
+        inst.module_run(['Google'])
+        self.assertTrue(all('apikey' not in p for p in captured))
+
+    def test_short_company_name_logs_error(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: (_ for _ in ()).throw(AssertionError('should not call request'))
+        inst.module_run(['Co'])
+        self.assertTrue(any('too short' in e for e in inst._errors))
+        self.assertEqual(inst._netblocks, [])
+
+    def test_multiple_asns_for_company_all_fetched(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(method, url, params=None, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                return self._asn_search_resp(
+                    ('15169', 'GOOGLE, US'),
+                    ('36040', 'GOOGLE-CLOUD, US'),
+                )
+            if calls[0] == 2:
+                return self._prefix_resp('15169', 'GOOGLE, US', '8.8.8.0/24')
+            return self._prefix_resp('36040', 'GOOGLE-CLOUD, US', '34.0.0.0/8')
+        inst.request = _req
+        inst.module_run(['Google'])
+        self.assertIn('8.8.8.0/24', inst._netblocks)
+        self.assertIn('34.0.0.0/8', inst._netblocks)
+
+    def test_ipv6_prefixes_inserted(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(method, url, params=None, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                return self._asn_search_resp(('15169', 'GOOGLE, US'))
+            return self._prefix_resp('15169', 'GOOGLE, US', '8.8.8.0/24', '2001:4860::/32')
+        inst.request = _req
+        inst.module_run(['Google'])
+        self.assertIn('2001:4860::/32', inst._netblocks)
+
+    def test_multiple_companies_each_queried(self):
+        inst = self._inst()
+        search_queries = []
+        calls = [0]
+        def _req(method, url, params=None, **kw):
+            calls[0] += 1
+            q = (params or {}).get('q', '')
+            if not q.startswith('AS'):
+                search_queries.append(q)
+                if 'Google' in q:
+                    return self._asn_search_resp(('15169', 'GOOGLE, US'))
+                return self._asn_search_resp(('16509', 'AMAZON-02, US'))
+            if '15169' in q:
+                return self._prefix_resp('15169', 'GOOGLE, US', '8.8.8.0/24')
+            return self._prefix_resp('16509', 'AMAZON-02, US', '54.0.0.0/8')
+        inst.request = _req
+        inst.module_run(['Google', 'Amazon'])
+        self.assertEqual(len(search_queries), 2)
+        self.assertIn('8.8.8.0/24', inst._netblocks)
+        self.assertIn('54.0.0.0/8', inst._netblocks)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Pretty runner
 # ═══════════════════════════════════════════════════════════════════════════════
 
