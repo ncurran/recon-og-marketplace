@@ -34,7 +34,7 @@ class Module(BaseModule):
                 continue
 
             params = {'q': company}
-            api_key = self.keys.get('hackertarget_api')
+            api_key = self.get_key('hackertarget_api')
             if api_key:
                 params['apikey'] = api_key
 
@@ -46,6 +46,9 @@ class Module(BaseModule):
             if resp.status_code != 200:
                 self.error(f"Unexpected response ({resp.status_code}) for '{company}'.")
                 continue
+            if 'API count exceeded' in resp.text:
+                self.error('Daily API quota exceeded. Set the hackertarget_api key or retry tomorrow.')
+                break
             if resp.text.startswith('error'):
                 self.output(f"No ASNs found for '{company}'.")
                 continue
@@ -75,6 +78,9 @@ class Module(BaseModule):
 
                 if resp.status_code == 429:
                     self.error('Rate limit reached. Set the hackertarget_api key or retry later.')
+                    return
+                if 'API count exceeded' in resp.text:
+                    self.error('Daily API quota exceeded. Set the hackertarget_api key or retry tomorrow.')
                     return
                 if resp.status_code != 200 or resp.text.startswith('error'):
                     self.error(f"Failed to retrieve prefixes for AS{asn_num}.")

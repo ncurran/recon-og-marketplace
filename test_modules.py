@@ -94,6 +94,9 @@ class MockBaseModule:
         }
         return defaults.get(table, [('id',)])
 
+    # keys ─────────────────────────────────────────────────────────────────────
+    def get_key(self, name):          return self.keys.get(name)
+
     # output ───────────────────────────────────────────────────────────────────
     def heading(self, text, level=0): pass
     def verbose(self, text):          pass
@@ -319,16 +322,141 @@ class TestHackerTarget(unittest.TestCase):
         inst.module_run(['example.com'])
         self.assertEqual(len(inst._hosts), 1)
 
-    def test_line_with_multiple_commas_skipped_gracefully(self):
-        """BUG: `host, address = line.split(",")` raises ValueError if a line
-        has more than one comma. The malformed line should be skipped and valid
-        lines should still be processed. Currently crashes the entire run."""
+    def test_line_with_multiple_commas_first_comma_split(self):
+        """Lines with >1 comma: host is everything before first comma, address is the rest."""
         inst = self._inst()
         inst.request = lambda *a, **kw: Resp(
             text='bad.example.com,1.2.3.4,extra\ngood.example.com,5.6.7.8'
         )
         inst.module_run(['example.com'])
-        self.assertEqual(len(inst._hosts), 1)  # bad line skipped, good line inserted
+        self.assertEqual(len(inst._hosts), 2)
+
+    def test_quota_exceeded_breaks_loop_and_errors(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='API count exceeded - Increase Quota with Membership')
+        inst.module_run(['example.com', 'other.com'])
+        self.assertTrue(any('quota exceeded' in e.lower() for e in inst._errors))
+        self.assertEqual(len(inst._hosts), 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# wayback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestWayback(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'wayback.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def _urls(self, *urls):
+        return Resp(text='\n'.join(urls))
+
+    def test_happy_path_inserts_subdomains(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._urls(
+            'https://sub1.example.com/page',
+            'http://sub2.example.com/other',
+        )
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertIn('sub1.example.com', hosts)
+        self.assertIn('sub2.example.com', hosts)
+
+    def test_deduplicates_same_host_from_multiple_urls(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._urls(
+            'https://sub.example.com/page1',
+            'https://sub.example.com/page2',
+            'http://sub.example.com/',
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 1)
+        self.assertEqual(inst._hosts[0]['host'], 'sub.example.com')
+
+    def test_external_domains_filtered_out(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._urls(
+            'https://sub.example.com/path',
+            'https://evil.com/redirect',
+            'https://unrelated.org/page',
+        )
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertEqual(hosts, ['sub.example.com'])
+
+    def test_bare_domain_itself_included(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._urls('https://example.com/path')
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts[0]['host'], 'example.com')
+
+    def test_urls_with_ports_parsed_correctly(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._urls('http://sub.example.com:8080/app')
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts[0]['host'], 'sub.example.com')
+
+    def test_empty_response_outputs_message_no_hosts(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='')
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 0)
+        self.assertTrue(any('No archived URLs' in o for o in inst._output))
+
+    def test_non_200_calls_error_and_continues(self):
+        results = [Resp(status=503), Resp(text='https://sub.other.com/')]
+        idx = [0]
+        def _req(*a, **kw):
+            r = results[min(idx[0], len(results) - 1)]
+            idx[0] += 1
+            return r
+        inst = self._inst()
+        inst.request = _req
+        inst.module_run(['example.com', 'other.com'])
+        self.assertTrue(any('503' in e for e in inst._errors))
+        self.assertEqual(inst._hosts[0]['host'], 'sub.other.com')
+
+    def test_blank_lines_in_response_skipped(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._urls(
+            'https://sub.example.com/',
+            '',
+            '   ',
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 1)
+
+    def test_wildcard_url_sent_for_domain(self):
+        captured = []
+        def _req(method, url, params=None, **kw):
+            captured.append(params or {})
+            return Resp(text='')
+        inst = self._inst()
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(captured[0]['url'], '*.example.com')
+
+    def test_multiple_domains_each_queried(self):
+        call_count = [0]
+        def _req(*a, **kw):
+            call_count[0] += 1
+            return Resp(text='')
+        inst = self._inst()
+        inst.request = _req
+        inst.module_run(['alpha.com', 'beta.com'])
+        self.assertEqual(call_count[0], 2)
+
+    def test_output_reports_count(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._urls(
+            'https://a.example.com/', 'https://b.example.com/'
+        )
+        inst.module_run(['example.com'])
+        self.assertTrue(any('2' in o and 'unique hosts' in o for o in inst._output))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1551,6 +1679,26 @@ class TestAsnLookup(unittest.TestCase):
         self.assertEqual(len(search_queries), 2)
         self.assertIn('8.8.8.0/24', inst._netblocks)
         self.assertIn('54.0.0.0/8', inst._netblocks)
+
+    def test_quota_exceeded_on_search_breaks_loop(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(text='API count exceeded - Increase Quota with Membership')
+        inst.module_run(['Google', 'Amazon'])
+        self.assertTrue(any('quota exceeded' in e.lower() for e in inst._errors))
+        self.assertEqual(inst._netblocks, [])
+
+    def test_quota_exceeded_on_prefix_fetch_returns_early(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(method, url, params=None, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                return self._asn_search_resp(('15169', 'GOOGLE, US'))
+            return Resp(text='API count exceeded - Increase Quota with Membership')
+        inst.request = _req
+        inst.module_run(['Google'])
+        self.assertTrue(any('quota exceeded' in e.lower() for e in inst._errors))
+        self.assertEqual(inst._netblocks, [])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
