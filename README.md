@@ -16,6 +16,13 @@ Modules are loaded from within the recon-og CLI. See the upstream [Development G
 | `recon/domains-hosts/wayback` | domains → hosts | Extracts unique subdomains from the [Wayback Machine CDX API](https://web.archive.org/cdx/search) by querying all archived URLs under a domain. Free, no API key required. |
 | `recon/companies-netblocks/asn_lookup` | companies → netblocks | Resolves company names to ASNs via the [HackerTarget ASN API](https://hackertarget.com/as-ip-lookup/), then fetches all announced CIDR prefixes (IPv4 and IPv6) and inserts them into the netblocks table. Filters to ASNs whose name shares a meaningful word with the company name. Supports a `hackertarget_api` key. Free tier: 50 requests/day. |
 
+### Bug fixes (still open upstream)
+
+| Module | Fix |
+|--------|-----|
+| `recon/companies-multi/whois_miner` | ARIN updated their "no results" response string; the old check no longer matched, causing the module to silently treat every lookup as a hit. Updated to match the current string. |
+| `recon/domains-hosts/hackertarget` | `host, address = line.split(",")` crashes on lines with multiple commas. Fixed to `split(",", 1)` with a length guard. Also handles the `"API count exceeded"` body that HackerTarget returns as a 200 OK when the free-tier daily quota is hit — previously fell through into the parser and crashed. |
+
 ### Removed modules
 
 | Module | Reason |
