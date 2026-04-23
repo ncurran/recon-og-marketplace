@@ -15,6 +15,7 @@ Modules are loaded from within the recon-og CLI. See the upstream [Development G
 | `recon/domains-hosts/certspotter` | domains → hosts | Passive subdomain enumeration via the [Cert Spotter](https://sslmate.com/certspotter/) CT log API. Paginates through all certificates, extracts SANs, and inserts unique hostnames. Supports a `certspotter_api` key for higher rate limits. |
 | `recon/domains-hosts/wayback` | domains → hosts | Extracts unique subdomains from the [Wayback Machine CDX API](https://web.archive.org/cdx/search) by querying all archived URLs under a domain. Free, no API key required. |
 | `recon/companies-netblocks/asn_lookup` | companies → netblocks | Resolves company names to ASNs via the [HackerTarget ASN API](https://hackertarget.com/as-ip-lookup/), then fetches all announced CIDR prefixes (IPv4 and IPv6) and inserts them into the netblocks table. Filters to ASNs whose name shares a meaningful word with the company name. Supports a `hackertarget_api` key. Free tier: 50 requests/day. |
+| `recon/hosts-hosts/permute` | hosts → hosts | Generates common hostname permutations (insertion like `dev.api.example.com`, prefix/suffix with dash, numeric suffix) and resolves each via DNS. Inserts any that return an A record. Equivalent to altdns/alterx. Wordlist configurable via the `words` option. |
 
 ### Bug fixes (still open upstream)
 
@@ -40,7 +41,7 @@ Modules are loaded from within the recon-og CLI. See the upstream [Development G
 python3 test_modules.py
 ```
 
-Currently 115 tests covering every module in this repo, including `TestModuleHealth` which fails if any module emits a `SyntaxWarning` at compile or fails to import.
+Currently 129 tests covering every module in this repo, including `TestModuleHealth` which fails if any module emits a `SyntaxWarning` at compile or fails to import.
 
 ---
 
@@ -49,7 +50,6 @@ Currently 115 tests covering every module in this repo, including `TestModuleHea
 
 | Module | Flow | What it does |
 |--------|------|-------------|
-| `recon/hosts-hosts/permute` | hosts → hosts | Hostname permutation (dev-, staging-, api-, -2, etc.) + DNS resolution. |
 | `recon/hosts-vulnerabilities/takeover` | hosts → vulnerabilities | CNAME chain walking + fingerprint against known-vulnerable services. |
 | `recon/hosts-ports/http_probe` | hosts → ports | Fast HTTP/HTTPS alive check — status, title, server header. |
 </content>

@@ -1789,6 +1789,167 @@ class TestAsnLookup(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# permute
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _FakeRdata:
+    def __init__(self, address, rdtype=1):
+        self.address = address
+        self.rdtype = rdtype
+
+
+class _FakeAnswers:
+    def __init__(self, rdatas):
+        self._rdatas = rdatas
+    def __iter__(self):
+        return iter(self._rdatas)
+
+
+class _FakeResolver:
+    """DNS resolver stub: table maps hostname -> list[address] | exception | None (NXDOMAIN)."""
+    def __init__(self, table):
+        self.table = table
+        self.queried = []
+
+    def query(self, host):
+        import dns.resolver
+        self.queried.append(host)
+        if host not in self.table:
+            raise dns.resolver.NXDOMAIN()
+        val = self.table[host]
+        if isinstance(val, Exception):
+            raise val
+        return _FakeAnswers([_FakeRdata(a) for a in val])
+
+
+class TestPermute(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'hosts-hosts', 'permute.py'))
+
+    def _inst(self, words=None):
+        inst = self.file.Module()
+        word_list = words if words is not None else 'dev,api'
+        inst.options = {'words': word_list}
+        return inst
+
+    def _run(self, inst, dns_table, hosts):
+        resolver = _FakeResolver(dns_table)
+        inst.get_resolver = lambda: resolver
+        inst.module_run(hosts)
+        return resolver
+
+    def test_happy_path_inserts_resolved_permutations(self):
+        inst = self._inst(words='dev')
+        self._run(inst, {
+            'dev.api.example.com': ['10.0.0.1'],
+            'dev-api.example.com': ['10.0.0.2'],
+        }, ['api.example.com'])
+        hosts = {h['host']: h['ip_address'] for h in inst._hosts}
+        self.assertEqual(hosts['dev.api.example.com'], '10.0.0.1')
+        self.assertEqual(hosts['dev-api.example.com'], '10.0.0.2')
+
+    def test_nxdomain_not_inserted(self):
+        inst = self._inst(words='dev')
+        self._run(inst, {}, ['api.example.com'])
+        self.assertEqual(inst._hosts, [])
+
+    def test_original_host_not_reinserted(self):
+        inst = self._inst(words='dev')
+        self._run(inst, {'api.example.com': ['10.0.0.99']}, ['api.example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertNotIn('api.example.com', hosts)
+
+    def test_single_label_host_skipped(self):
+        inst = self._inst(words='dev')
+        resolver = self._run(inst, {}, ['localhost'])
+        self.assertEqual(resolver.queried, [])
+        self.assertEqual(inst._hosts, [])
+
+    def test_numeric_suffix_pattern_generated(self):
+        inst = self._inst(words='')
+        resolver = self._run(inst, {'api2.example.com': ['10.0.0.7']}, ['api.example.com'])
+        self.assertIn('api1.example.com', resolver.queried)
+        self.assertIn('api2.example.com', resolver.queried)
+        self.assertIn('api3.example.com', resolver.queried)
+        self.assertEqual(inst._hosts[0]['host'], 'api2.example.com')
+
+    def test_insertion_prefix_suffix_patterns(self):
+        inst = self._inst(words='dev')
+        resolver = self._run(inst, {}, ['api.example.com'])
+        self.assertIn('dev.api.example.com', resolver.queried)
+        self.assertIn('dev-api.example.com', resolver.queried)
+        self.assertIn('api-dev.example.com', resolver.queried)
+
+    def test_deep_host_permutes_only_leftmost_label(self):
+        inst = self._inst(words='dev')
+        resolver = self._run(inst, {}, ['foo.bar.example.com'])
+        self.assertIn('dev.foo.bar.example.com', resolver.queried)
+        self.assertIn('dev-foo.bar.example.com', resolver.queried)
+        self.assertIn('foo1.bar.example.com', resolver.queried)
+        self.assertNotIn('dev.foo.example.com', resolver.queried)
+
+    def test_dns_error_skipped_gracefully(self):
+        import dns.resolver
+        inst = self._inst(words='dev')
+        self._run(inst, {
+            'dev.api.example.com': dns.resolver.Timeout(),
+            'dev-api.example.com': ['10.0.0.2'],
+        }, ['api.example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertIn('dev-api.example.com', hosts)
+        self.assertNotIn('dev.api.example.com', hosts)
+
+    def test_no_answer_skipped_gracefully(self):
+        import dns.resolver
+        inst = self._inst(words='dev')
+        self._run(inst, {'dev.api.example.com': dns.resolver.NoAnswer()}, ['api.example.com'])
+        self.assertEqual(inst._hosts, [])
+
+    def test_duplicate_candidates_queried_once(self):
+        inst = self._inst(words='dev')
+        resolver = self._run(inst, {'dev.api.example.com': ['10.0.0.1']},
+                             ['api.example.com', 'api.example.com'])
+        self.assertEqual(resolver.queried.count('dev.api.example.com'), 1)
+
+    def test_non_a_records_not_inserted(self):
+        inst = self._inst(words='dev')
+        resolver = _FakeResolver({})
+        def _q(host):
+            if host == 'dev.api.example.com':
+                return _FakeAnswers([_FakeRdata('2001:db8::1', rdtype=28)])
+            import dns.resolver as _r
+            raise _r.NXDOMAIN()
+        resolver.query = _q
+        inst.get_resolver = lambda: resolver
+        inst.module_run(['api.example.com'])
+        self.assertEqual(inst._hosts, [])
+
+    def test_multiple_source_hosts_each_processed(self):
+        inst = self._inst(words='dev')
+        self._run(inst, {
+            'dev.a.example.com': ['10.0.0.1'],
+            'dev.b.example.com': ['10.0.0.2'],
+        }, ['a.example.com', 'b.example.com'])
+        hosts = {h['host'] for h in inst._hosts}
+        self.assertIn('dev.a.example.com', hosts)
+        self.assertIn('dev.b.example.com', hosts)
+
+    def test_custom_wordlist_respected(self):
+        inst = self._inst(words='qux,flux')
+        resolver = self._run(inst, {}, ['api.example.com'])
+        self.assertIn('qux.api.example.com', resolver.queried)
+        self.assertIn('flux-api.example.com', resolver.queried)
+        self.assertNotIn('dev.api.example.com', resolver.queried)
+
+    def test_host_casing_normalised(self):
+        inst = self._inst(words='dev')
+        resolver = self._run(inst, {}, ['API.Example.COM'])
+        self.assertIn('dev.api.example.com', resolver.queried)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Pretty runner
 # ═══════════════════════════════════════════════════════════════════════════════
 
