@@ -105,6 +105,19 @@ class MockBaseModule:
     def alert(self, text):            self._output.append(f'ALERT:{text}')
 
 
+class _MixinStub:
+    """Placeholder base class so `class Module(BaseModule, SomeMixin)` works at import."""
+    pass
+
+
+def _mock_mixins_module(*names):
+    """Build a module-like object exposing each mixin name as an _MixinStub subclass."""
+    m = type(sys)('_mixin_stubs')
+    for name in names:
+        setattr(m, name, type(name, (_MixinStub,), {}))
+    return m
+
+
 def _bootstrap():
     """Inject mock recon framework into sys.modules before any module loads."""
     mock_core_module = MagicMock()
@@ -117,15 +130,31 @@ def _bootstrap():
         name.split()[-1] if name and len(name.split()) > 1 else None,
     )
 
+    mock_core_framework = type(sys)('recon.core.framework')
+    mock_core_framework.FrameworkException = type('FrameworkException', (Exception,), {})
+
     entries = [
         ('recon',               MagicMock()),
         ('recon.core',          MagicMock()),
         ('recon.core.module',   mock_core_module),
+        ('recon.core.framework', mock_core_framework),
         ('recon.utils',         MagicMock()),
         ('recon.utils.parsers', mock_utils_parsers),
+        ('recon.mixins',        MagicMock()),
+        ('recon.mixins.search', _mock_mixins_module('GoogleWebMixin', 'BingAPIMixin')),
+        ('recon.mixins.resolver', _mock_mixins_module('ResolverMixin')),
+        ('recon.mixins.threads',  _mock_mixins_module('ThreadingMixin')),
+        ('recon.mixins.github',   _mock_mixins_module('GithubMixin')),
+        ('recon.mixins.twitter',  _mock_mixins_module('TwitterMixin')),
     ]
     for key, val in entries:
         sys.modules.setdefault(key, val)
+
+    # ghdb.py loads data/ghdb.json at class body time; drop a stub so import works.
+    ghdb_stub = os.path.join(_TMP, 'ghdb.json')
+    if not os.path.exists(ghdb_stub):
+        with open(ghdb_stub, 'w') as fp:
+            fp.write('[]')
 
 
 _bootstrap()
@@ -161,6 +190,59 @@ def _shodan_available():
 
 
 _SKIP_SHODAN = unittest.skipUnless(_shodan_available(), 'shodan library not installed')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# module health (global sanity checks)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _all_module_files():
+    paths = []
+    for dirpath, _dirs, files in os.walk(_MOD):
+        for f in files:
+            if f.endswith('.py') and f != '__init__.py':
+                paths.append(os.path.join(dirpath, f))
+    return sorted(paths)
+
+
+class TestModuleHealth(unittest.TestCase):
+    """
+    Cross-cutting checks that apply to every module in the tree:
+      - no Python SyntaxWarnings (unescaped backslashes in regex strings, etc.)
+      - every module is importable (no dead dependencies, no renamed APIs)
+    A single broken module anywhere in the tree fails these tests.
+    """
+
+    def test_no_syntax_warnings_in_any_module(self):
+        import warnings as _warnings
+        failures = []
+        for path in _all_module_files():
+            with open(path) as f:
+                source = f.read()
+            with _warnings.catch_warnings(record=True) as caught:
+                _warnings.simplefilter('always')
+                compile(source, path, 'exec')
+                for w in caught:
+                    if issubclass(w.category, SyntaxWarning):
+                        rel = os.path.relpath(path, _REPO)
+                        failures.append(f'{rel}:{w.lineno}: {w.message}')
+        self.assertEqual(
+            failures, [],
+            'SyntaxWarnings found:\n  ' + '\n  '.join(failures),
+        )
+
+    def test_all_modules_importable(self):
+        failures = []
+        for path in _all_module_files():
+            try:
+                load_mod(path)
+            except Exception as e:
+                rel = os.path.relpath(path, _REPO)
+                failures.append(f'{rel}: {type(e).__name__}: {e}')
+        self.assertEqual(
+            failures, [],
+            'Module import failures:\n  ' + '\n  '.join(failures),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

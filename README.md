@@ -22,6 +22,9 @@ Modules are loaded from within the recon-og CLI. See the upstream [Development G
 |--------|-----|
 | `recon/companies-multi/whois_miner` | ARIN updated their "no results" response string; the old check no longer matched, causing the module to silently treat every lookup as a hit. Updated to match the current string. |
 | `recon/domains-hosts/hackertarget` | `host, address = line.split(",")` crashes on lines with multiple commas. Fixed to `split(",", 1)` with a length guard. Also handles the `"API count exceeded"` body that HackerTarget returns as a 200 OK when the free-tier daily quota is hit — previously fell through into the parser and crashed. |
+| `recon/companies-domains/censys_subdomains` | Import of `CensysCertificates` failed because the symbol was renamed to `CensysCerts` in `censys>=2.x`. Module was disabled on every startup. Updated import, constructor kwargs, and v2 `.search()` pagination signature. |
+| `recon/domains-contacts/metacrawler` | Depended on `PyPDF3` which is abandoned and no longer installable. Migrated to the actively maintained `pypdf` (`PdfFileReader` → `PdfReader`, `isEncrypted` → `is_encrypted`, `getDocumentInfo()` → `metadata`). Module was disabled on every startup. |
+| `recon/companies-contacts/bing_linkedin_cache`, `recon/domains-contacts/wikileaker`, `recon/contacts-contacts/mangle` | Regex strings contained unescaped backslashes (`'\d'`, `'\.'`, `'\s'`) in non-raw string literals. Emitted `SyntaxWarning` on every import under Python 3.12+ and will become `SyntaxError` in a future Python release. Converted to raw strings. |
 
 ### Removed modules
 
@@ -37,7 +40,7 @@ Modules are loaded from within the recon-og CLI. See the upstream [Development G
 python3 test_modules.py
 ```
 
-Currently 113 tests covering every module in this repo.
+Currently 115 tests covering every module in this repo, including `TestModuleHealth` which fails if any module emits a `SyntaxWarning` at compile or fails to import.
 
 ---
 
