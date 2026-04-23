@@ -1950,6 +1950,169 @@ class TestPermute(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# alienvault
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _otx_page(entries, has_next=False):
+    """Build a Resp mimicking the OTX url_list response shape.
+    entries is a list of dicts like {'hostname': 'x.example.com'} or
+    {'url': 'https://x.example.com/path'}."""
+    return Resp(status=200, data={
+        'url_list': entries,
+        'has_next': has_next,
+        'full_size': len(entries),
+        'actual_size': len(entries),
+        'page_num': 1,
+        'limit': 100,
+        'paged': True,
+    })
+
+
+class TestAlienVault(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'alienvault.py'))
+
+    def _inst(self, per_page=500, max_pages=100):
+        inst = self.file.Module()
+        inst.options = {'per_page': per_page, 'max_pages': max_pages}
+        return inst
+
+    def test_happy_path_extracts_hostnames(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _otx_page([
+            {'hostname': 'a.example.com', 'url': 'https://a.example.com/'},
+            {'hostname': 'b.example.com', 'url': 'https://b.example.com/x'},
+        ])
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertIn('a.example.com', hosts)
+        self.assertIn('b.example.com', hosts)
+
+    def test_external_hostnames_filtered(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _otx_page([
+            {'hostname': 'good.example.com'},
+            {'hostname': 'evil.attacker.com'},
+            {'hostname': 'unrelated.org'},
+        ])
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertEqual(hosts, ['good.example.com'])
+
+    def test_bare_domain_included(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _otx_page([{'hostname': 'example.com'}])
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts[0]['host'], 'example.com')
+
+    def test_deduplicates_across_pages(self):
+        pages = [
+            _otx_page([{'hostname': 'a.example.com'}, {'hostname': 'b.example.com'}], has_next=True),
+            _otx_page([{'hostname': 'b.example.com'}, {'hostname': 'c.example.com'}], has_next=False),
+        ]
+        idx = [0]
+        def _req(*a, **kw):
+            r = pages[idx[0]]
+            idx[0] += 1
+            return r
+        inst = self._inst()
+        inst.request = _req
+        inst.module_run(['example.com'])
+        hosts = sorted(h['host'] for h in inst._hosts)
+        self.assertEqual(hosts, ['a.example.com', 'b.example.com', 'c.example.com'])
+
+    def test_pagination_stops_on_has_next_false(self):
+        calls = [0]
+        def _req(*a, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                return _otx_page([{'hostname': 'a.example.com'}], has_next=True)
+            return _otx_page([{'hostname': 'b.example.com'}], has_next=False)
+        inst = self._inst()
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(calls[0], 2)
+
+    def test_max_pages_respected(self):
+        def _req(*a, **kw):
+            return _otx_page([{'hostname': 'a.example.com'}], has_next=True)
+        inst = self._inst(max_pages=3)
+        inst.request = _req
+        calls = [0]
+        def _counting(*a, **kw):
+            calls[0] += 1
+            return _req()
+        inst.request = _counting
+        inst.module_run(['example.com'])
+        self.assertEqual(calls[0], 3)
+
+    def test_falls_back_to_url_parsing(self):
+        """Entries without hostname field should still resolve via urlparse on url."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _otx_page([
+            {'url': 'https://sub.example.com:8080/path'},
+            {'url': 'http://other.example.com/'},
+        ])
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertIn('sub.example.com', hosts)
+        self.assertIn('other.example.com', hosts)
+
+    def test_empty_entries_empty_result(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _otx_page([], has_next=False)
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+
+    def test_non_200_errors_and_continues(self):
+        results = [Resp(status=503, data={}), _otx_page([{'hostname': 'ok.other.com'}])]
+        idx = [0]
+        def _req(*a, **kw):
+            r = results[min(idx[0], len(results) - 1)]
+            idx[0] += 1
+            return r
+        inst = self._inst()
+        inst.request = _req
+        inst.module_run(['example.com', 'other.com'])
+        self.assertTrue(any('503' in e for e in inst._errors))
+        self.assertEqual(inst._hosts[0]['host'], 'ok.other.com')
+
+    def test_host_casing_normalised(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _otx_page([
+            {'hostname': 'A.Example.COM'},
+            {'hostname': 'B.EXAMPLE.COM'},
+        ])
+        inst.module_run(['Example.COM'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertEqual(sorted(hosts), ['a.example.com', 'b.example.com'])
+
+    def test_multiple_domains_each_queried(self):
+        seen = []
+        def _req(method, url, params=None, **kw):
+            seen.append(url)
+            return _otx_page([], has_next=False)
+        inst = self._inst()
+        inst.request = _req
+        inst.module_run(['a.com', 'b.com'])
+        self.assertEqual(len(seen), 2)
+        self.assertIn('/indicators/domain/a.com/url_list', seen[0])
+        self.assertIn('/indicators/domain/b.com/url_list', seen[1])
+
+    def test_per_page_parameter_forwarded(self):
+        captured = []
+        def _req(method, url, params=None, **kw):
+            captured.append(params or {})
+            return _otx_page([], has_next=False)
+        inst = self._inst(per_page=250)
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(captured[0].get('limit'), 250)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Pretty runner
 # ═══════════════════════════════════════════════════════════════════════════════
 
