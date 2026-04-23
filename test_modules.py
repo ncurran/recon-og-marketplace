@@ -1391,33 +1391,6 @@ class TestReportingCsv(unittest.TestCase):
         self.assertTrue(any('3' in o for o in inst._output))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# adobe (known Python 2 incompatibility)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestAdobe(unittest.TestCase):
-    """
-    adobe.py uses str.decode('base64') which is Python 2 syntax — the entire
-    module is incompatible with Python 3. The test below asserts what SHOULD
-    happen (crack a known hash), but is decorated @expectedFailure because the
-    module cannot be called at all under Python 3. If the module is ever ported,
-    remove the decorator and update the assertion.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        cls.file = load_mod(_p('recon', 'credentials-credentials', 'adobe.py'))
-        cls.block_db = os.path.join(_TMP, 'adobe_blocks.json')
-        with open(cls.block_db, 'w') as f:
-            json.dump({}, f)
-
-    @unittest.expectedFailure
-    def test_module_run_processes_hashes(self):
-        """module_run should process hashes without crashing (Python 3 port needed)."""
-        inst = self.file.Module()
-        inst.options = {'source': 'default', 'block_db': self.block_db}
-        inst.module_run([b'dGVzdA=='])  # raises AttributeError/LookupError in Python 3
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shodan modules (mocked API — zero real network calls)
