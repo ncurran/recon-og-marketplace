@@ -51,6 +51,7 @@ class MockBaseModule:
         self._netblocks = []
         self._ports     = []
         self._domains   = []
+        self._vulnerabilities = []
         self._queries   = []
         self._output    = []
         self._errors    = []
@@ -80,6 +81,9 @@ class MockBaseModule:
 
     def insert_domains(self, domain=None):
         self._domains.append(domain)
+
+    def insert_vulnerabilities(self, **kw):
+        self._vulnerabilities.append(kw)
 
     # DB ───────────────────────────────────────────────────────────────────────
     def query(self, sql, values=None):
@@ -172,10 +176,11 @@ def load_mod(filepath):
 
 class Resp:
     """Lightweight mock HTTP response."""
-    def __init__(self, status=200, text='', data=None):
+    def __init__(self, status=200, text='', data=None, headers=None):
         self.status_code = status
         self.text = text
         self._data = data if data is not None else {}
+        self.headers = headers if headers is not None else {}
 
     def json(self):
         return self._data
