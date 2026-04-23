@@ -34,7 +34,7 @@ Modules are loaded from within the recon-og CLI. See the upstream [Development G
 |--------|--------|
 | `recon/domains-hosts/certificate_transparency` | Replaced by `certspotter`. The crt.sh backend is rate-limited and returns inconsistent results; Cert Spotter's paginated API is more reliable. |
 | `recon/credentials-credentials/adobe` | Backend resource (`stricture-group.com/files/adobe-top100.txt`) now 302-redirects to the homepage — the 2013 Adobe-breach hash list is no longer served. Module also uses Python 2 `str.decode('base64')` and has never worked under Python 3. `hibp_breach` and `hibp_paste` cover the Adobe breach plus every other major breach in HIBP's canonical DB. |
-| `recon/profiles-profiles/namechk` | `namechk.com` is behind a Cloudflare JS challenge (HTTP 403 on any programmatic access). `profiler` (WhatsMyName-backed) covers the same username-check-on-many-sites capability with a broader, maintained site list. |
+| `recon/profiles-profiles/namechk` | The module called `api.namechk.com`, whose DNS no longer resolves (`curl: (6) Could not resolve host`). The public web UI at `namechk.com` is still up but sits behind a Cloudflare JS challenge (HTTP 403 on any programmatic access). `profiler` (WhatsMyName-backed) covers the same username-check-on-many-sites capability with a broader, maintained site list. |
 | `recon/domains-vulnerabilities/xssed` | `xssed.com` search still responds but individual mirror detail pages return HTTP 500 — result IDs come back but nothing can be fetched from them. Site has also not added new data since ~2013. No modern equivalent with an open API (OpenBugBounty, the closest candidate, is Cloudflare-gated). |
 
 ### Test suite
