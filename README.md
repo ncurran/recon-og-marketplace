@@ -46,15 +46,3 @@ python3 test_modules.py
 ```
 
 Currently 140 tests covering every module in this repo, including `TestModuleHealth` which fails if any module emits a `SyntaxWarning` at compile or fails to import.
-
----
-
-## Planned modules
-
-
-| Module | Flow | What it does |
-|--------|------|-------------|
-| `recon/hosts-vulnerabilities/takeover` | hosts → vulnerabilities | CNAME chain walking + fingerprint against known-vulnerable services. |
-| `recon/hosts-ports/http_probe` | hosts → ports | Fast HTTP/HTTPS alive check — status, title, server header. |
-</content>
-</invoke>
