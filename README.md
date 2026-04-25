@@ -45,4 +45,4 @@ Modules are loaded from within the recon-og CLI. See the upstream [Development G
 python3 test_modules.py
 ```
 
-Currently 166 tests covering every module in this repo, including `TestModuleHealth` which fails if any module emits a `SyntaxWarning` at compile or fails to import.
+Currently 172 tests covering every module in this repo, including `TestModuleHealth` which fails if any module emits a `SyntaxWarning` at compile or fails to import.

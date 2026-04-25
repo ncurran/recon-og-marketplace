@@ -88,6 +88,11 @@ class MockBaseModule:
     # DB ───────────────────────────────────────────────────────────────────────
     def query(self, sql, values=None):
         self._queries.append((sql, values))
+        # Tests can stub responses by setting inst._query_responses = {sql_substring: [(row,), ...]}.
+        # Match by substring so tests don't have to spell out the whole SQL.
+        for needle, rows in getattr(self, '_query_responses', {}).items():
+            if needle in sql:
+                return rows
         return []
 
     def get_columns(self, table):
@@ -2241,6 +2246,109 @@ class TestPermute(unittest.TestCase):
         inst = self._inst(words='dev')
         resolver = self._run(inst, {}, ['API.Example.COM'])
         self.assertIn('dev.api.example.com', resolver.queried)
+
+    # ── scope filter (regression: brute_hosts captures CNAME targets like
+    #    *.cdn.cloudflare.net / *.outlook.com; permute used to fan out from
+    #    them, multiplying vendor-infrastructure noise by 30-40x via DNS
+    #    fan-out. The fix scopes permute to hosts under domains in the
+    #    `domains` table.)
+
+    def test_off_domain_host_skipped_when_in_scope_set(self):
+        """A CNAME-target-style off-domain host must be skipped when
+        `domains` table has at least one in-scope entry."""
+        inst = self._inst(words='dev')
+        inst._query_responses = {
+            'SELECT domain FROM domains': [('starbucks.com',)],
+        }
+        resolver = _FakeResolver({})
+        inst.get_resolver = lambda: resolver
+        # Off-domain CNAME target (the kind brute_hosts records); must NOT be permuted.
+        inst.module_run([
+            'webfarm-50.q4web.com',
+            'autodiscover.outlook.com',
+            'd1zsws4x9b0vy6.cloudfront.net',
+        ])
+        # Resolver should never have been queried (all hosts filtered out)
+        self.assertEqual(resolver.queried, [],
+                         msg=f"unexpectedly queried: {resolver.queried}")
+        # And no rows inserted
+        self.assertEqual(inst._hosts, [])
+        # And the summary line was emitted
+        self.assertTrue(any('outside of in-scope domains' in o for o in inst._output))
+
+    def test_in_scope_host_permuted_when_in_scope_set(self):
+        inst = self._inst(words='dev')
+        inst._query_responses = {
+            'SELECT domain FROM domains': [('starbucks.com',)],
+        }
+        resolver = _FakeResolver({'dev.www.starbucks.com': ['10.0.0.1']})
+        inst.get_resolver = lambda: resolver
+        inst.module_run(['www.starbucks.com'])
+        self.assertIn('dev.www.starbucks.com', [h['host'] for h in inst._hosts])
+
+    def test_apex_in_scope_host_permuted(self):
+        """The apex domain itself (e.g. starbucks.com) must be a valid
+        permutation seed when it's in the domains table."""
+        inst = self._inst(words='dev')
+        inst._query_responses = {
+            'SELECT domain FROM domains': [('example.com',)],
+        }
+        resolver = _FakeResolver({'dev.example.com': ['10.0.0.1']})
+        inst.get_resolver = lambda: resolver
+        inst.module_run(['example.com'])
+        self.assertIn('dev.example.com', [h['host'] for h in inst._hosts])
+
+    def test_lookalike_suffix_not_in_scope(self):
+        """`evilexample.com` byte-suffix-matches `example.com` but is a
+        different registered domain. Must be skipped."""
+        inst = self._inst(words='dev')
+        inst._query_responses = {
+            'SELECT domain FROM domains': [('example.com',)],
+        }
+        resolver = _FakeResolver({})
+        inst.get_resolver = lambda: resolver
+        inst.module_run(['mail.evilexample.com'])
+        self.assertEqual(resolver.queried, [])
+
+    def test_multiple_in_scope_domains(self):
+        """Acquisition workflow: starbucks.com plus 23-5degrees.com etc.
+        all in the domains table — hosts under any of them should permute."""
+        inst = self._inst(words='dev')
+        inst._query_responses = {
+            'SELECT domain FROM domains': [
+                ('starbucks.com',), ('23-5degrees.com',), ('teavana.com',),
+            ],
+        }
+        resolver = _FakeResolver({
+            'dev.www.starbucks.com':   ['10.0.0.1'],
+            'dev.www.23-5degrees.com': ['10.0.0.2'],
+            'dev.www.teavana.com':     ['10.0.0.3'],
+        })
+        inst.get_resolver = lambda: resolver
+        inst.module_run([
+            'www.starbucks.com',
+            'www.23-5degrees.com',
+            'www.teavana.com',
+            'unrelated.tenant.com',  # off-domain — must be skipped
+        ])
+        hosts = {h['host'] for h in inst._hosts}
+        self.assertIn('dev.www.starbucks.com', hosts)
+        self.assertIn('dev.www.23-5degrees.com', hosts)
+        self.assertIn('dev.www.teavana.com', hosts)
+
+    def test_empty_domains_falls_back_to_permit_all_with_warning(self):
+        """Backwards compatibility: if domains table is empty, permute
+        falls back to its legacy 'permute everything' behaviour but
+        SHOUTS about the scope filter being disabled."""
+        inst = self._inst(words='dev')
+        inst._query_responses = {}  # nothing returned by query
+        resolver = _FakeResolver({'dev.example.com': ['10.0.0.1']})
+        inst.get_resolver = lambda: resolver
+        inst.module_run(['example.com'])
+        self.assertIn('dev.example.com', [h['host'] for h in inst._hosts])
+        # Loud warning fires
+        self.assertTrue(any('Scope filter DISABLED' in e for e in inst._errors),
+                        msg=f"errors: {inst._errors}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

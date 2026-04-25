@@ -15,7 +15,7 @@ class Module(BaseModule, ResolverMixin):
     meta = {
         'name': 'Hostname Permutation',
         'author': 'Nicholas Curran (@ncurran)',
-        'version': '1.0',
+        'version': '1.1',
         'description': (
             'Generates common permutations of known hostnames (dev-, staging-, '
             'api-, -2, etc.), resolves each via DNS, and inserts any that return '
@@ -25,6 +25,10 @@ class Module(BaseModule, ResolverMixin):
             'Uses the leftmost label of each host as the permutation seed.',
             'Patterns: insertion (word.host), prefix (word-leaf.rest), '
             'suffix (leaf-word.rest), and numeric suffix (leaf1, leaf2, leaf3).',
+            'Only fans out from hosts whose root is in the domains table — '
+            'CNAME targets recorded by brute_hosts (e.g. *.cdn.cloudflare.net, '
+            '*.outlook.com) are skipped to avoid permuting vendor infrastructure '
+            'into the workspace. Add such domains to the domains table to opt in.',
         ),
         'query': 'SELECT DISTINCT host FROM hosts WHERE host IS NOT NULL',
         'options': (
@@ -37,10 +41,39 @@ class Module(BaseModule, ResolverMixin):
         resolver = self.get_resolver()
         seen = set()
 
+        # Scope filter: only fan out from hosts under a known in-scope domain.
+        # brute_hosts records CNAME targets as separate hosts (e.g. cloudflare,
+        # akamai, outlook autodiscover) which are valid recon intel for
+        # http_probe/takeover but must not become permutation seeds — that
+        # multiplies vendor-infrastructure noise 30-40x via DNS fan-out.
+        in_scope_rows = self.query(
+            'SELECT domain FROM domains WHERE domain IS NOT NULL'
+        ) or []
+        in_scope = {
+            (r[0].lower().rstrip('.') if r and r[0] else '')
+            for r in in_scope_rows
+        }
+        in_scope.discard('')
+        if not in_scope:
+            # No domains seeded — fall back to the legacy "permute everything"
+            # behaviour, but flag it loudly because the operator probably wants
+            # the scope filter on.
+            self.error(
+                "Scope filter DISABLED: domains table is empty. Seed at least "
+                "one domain (`db insert domains <root>~`) to prevent permute "
+                "from fanning out off-domain CNAME targets recorded by "
+                "brute_hosts (cloudflare, akamai, outlook, q4web, etc.)."
+            )
+        out_of_scope_skipped = 0
+
         for host in hosts:
             host = host.lower()
             if '.' not in host:
                 self.verbose(f"Skipping '{host}' (no subdomain to permute).")
+                continue
+            if in_scope and not _in_scope(host, in_scope):
+                self.verbose(f"Skipping '{host}' (not under any in-scope domain).")
+                out_of_scope_skipped += 1
                 continue
 
             leaf, _, rest = host.partition('.')
@@ -72,6 +105,13 @@ class Module(BaseModule, ResolverMixin):
 
             self.output(f"{new_inserted} new hosts from permutations of '{host}'.")
 
+        if out_of_scope_skipped:
+            self.output(
+                f"Skipped {out_of_scope_skipped} host(s) outside of in-scope "
+                f"domains (CNAME targets / vendor infra). Add those domains to "
+                f"the domains table if you want them permuted."
+            )
+
     @staticmethod
     def _candidates(leaf, rest, host, words):
         out = []
@@ -88,3 +128,14 @@ class Module(BaseModule, ResolverMixin):
         for n in ('1', '2', '3'):
             out.append(f'{leaf}{n}.{rest}')
         return out
+
+
+def _in_scope(host, in_scope_domains):
+    """True iff host equals any in-scope domain or is a subdomain of one."""
+    if not host or not in_scope_domains:
+        return False
+    h = host.lower().rstrip('.')
+    for d in in_scope_domains:
+        if h == d or h.endswith('.' + d):
+            return True
+    return False
