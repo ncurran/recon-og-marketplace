@@ -23,8 +23,14 @@ class Module(BaseModule):
     }
 
     def module_run(self, domains):
+        source_disabled = False
         for domain in domains:
             self.heading(domain, level=0)
+            if source_disabled:
+                self.verbose(
+                    f"Skipping '{domain}': certspotter disabled earlier this run."
+                )
+                continue
             after = None
             while True:
                 params = {
@@ -42,20 +48,22 @@ class Module(BaseModule):
                 )
 
                 if resp.status_code == 429:
-                    # Highlight rate-limit failures so they don't get lost in
-                    # the noise of a long pipeline run. Free-tier Certspotter
-                    # is 10 include_subdomains queries/hour; partial pages
-                    # before the limit hits mean enumeration is INCOMPLETE.
+                    # Free-tier Certspotter is 10 include_subdomains queries/hour;
+                    # once we've hit the limit, every remaining domain in this
+                    # run is going to 429 too, so disable the source for the
+                    # rest of the run instead of thrashing.
                     retry_after = (resp.headers or {}).get('Retry-After')
                     detail = f" (Retry-After: {retry_after}s)" if retry_after else ''
                     msg = (
                         f"RATE LIMITED: certspotter free tier exhausted on "
                         f"'{domain}'{detail}. Enumeration for this domain is "
                         f"INCOMPLETE — set 'certspotter_api' key to raise the "
-                        f"limit, or re-run after the quota resets."
+                        f"limit, or re-run after the quota resets. Disabling "
+                        f"certspotter for the rest of this run."
                     )
                     self.alert(msg)
                     self.error(msg)
+                    source_disabled = True
                     break
                 if resp.status_code != 200:
                     self.error(f"Unexpected response for '{domain}': {resp.status_code}")

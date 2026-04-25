@@ -2515,6 +2515,184 @@ class TestAlienVault(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# subdomain_center
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _SCResp:
+    """Mock for subdomain.center: status, headers, json() return list-of-strings or raise."""
+    def __init__(self, status=200, payload=None, headers=None, json_raises=False):
+        self.status_code = status
+        self.headers = headers or {}
+        self._payload = payload if payload is not None else []
+        self._raises = json_raises
+
+    def json(self):
+        if self._raises:
+            raise ValueError('not JSON')
+        return self._payload
+
+
+class TestSubdomainCenter(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'subdomain_center.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_happy_path_inserts_filtered_hosts(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _SCResp(payload=[
+            'mail.example.com', 'api.example.com', 'orphan.unrelated.com',
+            '*.example.com', 'WWW.Example.COM', 'evilexample.com',
+        ])
+        inst.module_run(['example.com'])
+        hosts = sorted(h['host'] for h in inst._hosts)
+        # off-domain dropped, wildcard skipped, lookalike rejected, casing normalised
+        self.assertEqual(hosts, ['api.example.com', 'mail.example.com', 'www.example.com'])
+
+    def test_429_disables_source_for_remaining_domains(self):
+        """First domain hits 429 → remaining domains in this run must be
+        skipped without further requests, and a single loud alert fires."""
+        inst = self._inst()
+        calls = []
+        def _req(*a, **kw):
+            calls.append(a[1] if len(a) > 1 else kw.get('url'))
+            return _SCResp(status=429, headers={'Retry-After': '60'})
+        inst.request = _req
+        inst.module_run(['a.example', 'b.example', 'c.example'])
+        # Only one request actually made
+        self.assertEqual(len(calls), 1, msg=f"calls: {calls}")
+        # Loud alert + error fired exactly once
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertEqual(len(alerts), 1, msg=f"alerts: {alerts}")
+        joined = ' '.join(alerts + inst._errors)
+        self.assertIn('UPSTREAM ERROR', joined)
+        self.assertIn('429', joined)
+        self.assertIn('60', joined)
+        self.assertIn('disabling', joined)
+        self.assertIn('rest of this run', joined)
+
+    def test_521_cloudflare_origin_unreachable_disables_source(self):
+        """Cloudflare 521/522/523/524 (origin unreachable) is the most common
+        subdomain.center failure mode — must be treated as fail-fast."""
+        for code in (521, 522, 523, 524):
+            with self.subTest(code=code):
+                inst = self._inst()
+                calls = [0]
+                def _req(*a, _c=code, **kw):
+                    calls[0] += 1
+                    return _SCResp(status=_c)
+                inst.request = _req
+                inst.module_run(['a.example', 'b.example', 'c.example'])
+                self.assertEqual(calls[0], 1)
+                joined = ' '.join(inst._output) + ' ' + ' '.join(inst._errors)
+                self.assertIn('UPSTREAM ERROR', joined)
+                self.assertIn(str(code), joined)
+
+    def test_request_exception_disables_source(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(*a, **kw):
+            calls[0] += 1
+            raise ConnectionError('connect refused')
+        inst.request = _req
+        inst.module_run(['a.example', 'b.example'])
+        self.assertEqual(calls[0], 1)
+        joined = ' '.join(inst._output) + ' ' + ' '.join(inst._errors)
+        self.assertIn('UPSTREAM ERROR', joined)
+        self.assertIn('ConnectionError', joined)
+
+    def test_non_200_4xx_continues_without_disabling(self):
+        """A 404 on one domain is not necessarily a source-wide problem; keep
+        going, just log a normal error for that domain."""
+        inst = self._inst()
+        calls = [0]
+        def _req(*a, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                return _SCResp(status=404)
+            return _SCResp(payload=['ok.example'])
+        inst.request = _req
+        inst.module_run(['first.example', 'second.example'])
+        self.assertEqual(calls[0], 2)
+        # No loud alert for 4xx
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertEqual(alerts, [])
+        # 'ok.example' might match second.example? No — sanity: it doesn't.
+        # The point is just that the second domain's request was attempted.
+
+    def test_non_json_body_does_not_crash(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _SCResp(status=200, json_raises=True)
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+        self.assertTrue(any('Non-JSON' in e for e in inst._errors))
+
+    def test_unexpected_response_shape_handled(self):
+        """If subdomain.center ever changes to return a dict, don't crash."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _SCResp(payload={'subdomains': ['ok.example.com']})
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+        self.assertTrue(any('expected list' in e for e in inst._errors))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Fail-fast retrofit regression tests for the two existing CT modules
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCTFailFast(unittest.TestCase):
+    """Regression: when a CT source hits 429 / upstream-error on the first
+    domain, it must NOT continue retrying every remaining domain. That was
+    the bug that produced 7+ alerts per run (one per domain) and burned wall
+    time."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.certspotter = load_mod(_p('recon', 'domains-hosts', 'certspotter.py'))
+        cls.crtsh = load_mod(_p('recon', 'domains-hosts', 'certificate_transparency.py'))
+
+    def test_certspotter_429_skips_remaining_domains(self):
+        inst = self.certspotter.Module()
+        calls = []
+        def _req(method, url, **kw):
+            calls.append(kw.get('params', {}).get('domain'))
+            return Resp(status=429, text='Too Many Requests')
+        inst.request = _req
+        inst.module_run(['a.example', 'b.example', 'c.example', 'd.example'])
+        # Exactly one request — the first 429 disabled the source
+        self.assertEqual(len(calls), 1, msg=f"calls: {calls}")
+        # Exactly one loud alert
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertEqual(len(alerts), 1, msg=f"alerts: {alerts}")
+
+    def test_crtsh_502_skips_remaining_domains(self):
+        # _CrtshResp from earlier in the file
+        inst = self.crtsh.Module()
+        calls = [0]
+        def _req(method, url, **kw):
+            calls[0] += 1
+            return _CrtshResp(status=502)
+        inst.request = _req
+        inst.module_run(['a.example', 'b.example', 'c.example'])
+        self.assertEqual(calls[0], 1)
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertEqual(len(alerts), 1, msg=f"alerts: {alerts}")
+
+    def test_crtsh_request_exception_skips_remaining_domains(self):
+        inst = self.crtsh.Module()
+        calls = [0]
+        def _req(method, url, **kw):
+            calls[0] += 1
+            raise ConnectionError('connection refused')
+        inst.request = _req
+        inst.module_run(['a.example', 'b.example', 'c.example'])
+        self.assertEqual(calls[0], 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Pretty runner
 # ═══════════════════════════════════════════════════════════════════════════════
 

@@ -23,8 +23,14 @@ class Module(BaseModule):
     }
 
     def module_run(self, domains):
+        source_disabled = False
         for domain in domains:
             self.heading(domain, level=0)
+            if source_disabled:
+                self.verbose(
+                    f"Skipping '{domain}': crt.sh disabled earlier this run."
+                )
+                continue
             url = f"https://crt.sh/?q=%25.{domain}&output=json"
 
             try:
@@ -33,19 +39,26 @@ class Module(BaseModule):
                     headers={'Accept': 'application/json'},
                 )
             except Exception as exc:
+                # Once crt.sh starts timing out / refusing connections, every
+                # remaining query in this run will hit the same wall. Stop now.
+                source_disabled = True
                 self._loud_upstream_failure(
-                    domain, f"request failed ({exc.__class__.__name__}: {exc})"
+                    domain,
+                    f"request failed ({exc.__class__.__name__}: {exc}); "
+                    f"disabling crt.sh for the rest of this run"
                 )
                 continue
 
             if resp.status_code in (429, 502, 503, 504):
                 retry_after = (resp.headers or {}).get('Retry-After')
                 detail = f" (Retry-After: {retry_after}s)" if retry_after else ''
+                source_disabled = True
                 self._loud_upstream_failure(
                     domain,
                     f"crt.sh returned HTTP {resp.status_code}{detail}; "
-                    f"the service is frequently overloaded. Use certspotter as "
-                    f"a redundant CT source"
+                    f"the service is frequently overloaded. Disabling for "
+                    f"the rest of this run; use certspotter or "
+                    f"subdomain_center as alternatives"
                 )
                 continue
 
