@@ -251,6 +251,228 @@ class TestModuleHealth(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# certificate_transparency (crt.sh)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _CrtshResp:
+    """Mock response that mimics requests.Response for the crt.sh module:
+    .status_code, .headers, and .json() that can either return data or raise."""
+    def __init__(self, status=200, data=None, headers=None, json_raises=False):
+        self.status_code = status
+        self.headers = headers or {}
+        self._data = data
+        self._raises = json_raises
+
+    def json(self):
+        if self._raises:
+            raise ValueError("not JSON")
+        return self._data if self._data is not None else []
+
+
+class TestCertificateTransparency(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'certificate_transparency.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def _resp(self, *certs, **kw):
+        return _CrtshResp(data=[{'name_value': '\n'.join(c)} for c in certs], **kw)
+
+    # ── happy path & basic ingestion ──────────────────────────────────────────
+
+    def test_happy_path_inserts_hosts(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(
+            ['mail.example.com', 'api.example.com'],
+        )
+        inst.module_run(['example.com'])
+        hosts = sorted(h['host'] for h in inst._hosts)
+        self.assertEqual(hosts, ['api.example.com', 'mail.example.com'])
+
+    def test_multiple_sans_per_certificate(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(
+            ['a.example.com', 'b.example.com', 'c.example.com'],
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(len(inst._hosts), 3)
+
+    def test_multiple_domains_each_queried(self):
+        seen = []
+        def _req(method, url, **kw):
+            seen.append(url)
+            return self._resp([])
+        inst = self._inst()
+        inst.request = _req
+        inst.module_run(['alpha.com', 'beta.com'])
+        self.assertEqual(len(seen), 2)
+        self.assertIn('alpha.com', seen[0])
+        self.assertIn('beta.com', seen[1])
+
+    # ── SAN filtering (the same multi-tenant cert leak we fixed in certspotter) ─
+
+    def test_off_domain_san_on_shared_cert_dropped(self):
+        """Multi-tenant cert: a single cert listed s7.example.com alongside
+        s7.jcrew.com etc. Only the queried domain's subdomain may be ingested."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(
+            ['s7.example.com', 's7.jcrew.com', 's7.madewell.com', 'dam.ey.com'],
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['s7.example.com'])
+
+    def test_apex_match_kept(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(['example.com'])
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['example.com'])
+
+    def test_lookalike_suffix_not_matched(self):
+        """`evilexample.com` byte-suffix-matches `example.com` but is a
+        different registered domain. Must not be ingested."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(
+            ['evilexample.com', 'mail.evilexample.com'],
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+
+    def test_wildcard_san_skipped(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(
+            ['*.example.com', 'real.example.com'],
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['real.example.com'])
+
+    def test_match_is_case_insensitive(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(['MAIL.Example.COM'])
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['mail.example.com'])
+
+    def test_trailing_dot_normalised(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(['mail.example.com.'])
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['mail.example.com'])
+
+    # ── email SANs ────────────────────────────────────────────────────────────
+
+    def test_email_san_inserts_contact_when_host_matches(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(['admin@example.com'])
+        inst.module_run(['example.com'])
+        self.assertEqual([c['email'] for c in inst._contacts], ['admin@example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['example.com'])
+
+    def test_email_san_with_off_domain_host_skipped(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: self._resp(
+            ['admin@unrelated.com', 'admin@example.com'],
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual([c['email'] for c in inst._contacts], ['admin@example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['example.com'])
+
+    # ── null/missing name_value ──────────────────────────────────────────────
+
+    def test_null_name_value_handled_gracefully(self):
+        """A cert with name_value=None must not crash the module."""
+        inst = self._inst()
+        # Build a response where one cert is well-formed and one has null
+        inst.request = lambda *a, **kw: _CrtshResp(data=[
+            {'name_value': None},
+            {'name_value': 'mail.example.com'},
+        ])
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['mail.example.com'])
+
+    def test_missing_name_value_key_handled_gracefully(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _CrtshResp(data=[
+            {},  # no name_value key at all
+            {'name_value': 'mail.example.com'},
+        ])
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['mail.example.com'])
+
+    # ── upstream failure modes (crt.sh is overloaded fairly often) ───────────
+
+    def test_502_alerts_and_errors_loudly(self):
+        """502 must surface BOTH via alert() and error(), and the message
+        must say enumeration is INCOMPLETE — crt.sh is famously flaky."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _CrtshResp(status=502)
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertTrue(any('UPSTREAM ERROR' in a for a in alerts), msg=f"alerts={alerts}")
+        self.assertTrue(any('UPSTREAM ERROR' in e for e in inst._errors), msg=f"errors={inst._errors}")
+        joined = ' '.join(alerts + inst._errors)
+        self.assertIn('INCOMPLETE', joined)
+        self.assertIn("'example.com'", joined)
+        self.assertIn('502', joined)
+
+    def test_503_504_429_all_alert_loudly(self):
+        for code in (503, 504, 429):
+            with self.subTest(code=code):
+                inst = self._inst()
+                inst.request = lambda *a, _c=code, **kw: _CrtshResp(status=_c)
+                inst.module_run(['example.com'])
+                joined = ' '.join(inst._output) + ' ' + ' '.join(inst._errors)
+                self.assertIn('UPSTREAM ERROR', joined)
+                self.assertIn(str(code), joined)
+
+    def test_retry_after_header_surfaced_in_message(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _CrtshResp(
+            status=503, headers={'Retry-After': '120'},
+        )
+        inst.module_run(['example.com'])
+        joined = ' '.join(inst._output) + ' ' + ' '.join(inst._errors)
+        self.assertIn('Retry-After', joined)
+        self.assertIn('120', joined)
+
+    def test_request_raises_treated_as_loud_upstream_failure(self):
+        """Connection errors / timeouts / TLS failures must be surfaced
+        as loudly as 5xx so the operator sees the partial enumeration."""
+        inst = self._inst()
+        def _req(*a, **kw):
+            raise ConnectionError("name resolution failed")
+        inst.request = _req
+        inst.module_run(['example.com'])
+        joined = ' '.join(inst._output) + ' ' + ' '.join(inst._errors)
+        self.assertIn('UPSTREAM ERROR', joined)
+        self.assertIn('INCOMPLETE', joined)
+        self.assertIn('ConnectionError', joined)
+
+    def test_non_json_body_does_not_crash(self):
+        """crt.sh sometimes returns an HTML error page with status 200.
+        Module must error cleanly rather than throwing."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _CrtshResp(status=200, json_raises=True)
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+        self.assertTrue(any('Non-JSON' in e for e in inst._errors), msg=f"errors={inst._errors}")
+
+    def test_other_4xx_continues_with_simple_error(self):
+        """A 404 etc. should log a normal error and continue — no need
+        for the loud alert channel."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _CrtshResp(status=404)
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+        self.assertTrue(any('404' in e for e in inst._errors))
+        # Should NOT have used the loud alert channel for plain 4xx
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertEqual(alerts, [], msg=f"unexpected alerts: {alerts}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # certspotter
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -326,12 +548,38 @@ class TestCertspotter(unittest.TestCase):
         self.assertEqual(len(inst._hosts), 0)
         self.assertTrue(len(inst._errors) > 0)
 
-    def test_rate_limit_429_calls_error_and_stops(self):
+    def test_rate_limit_429_alerts_and_errors_loudly(self):
+        """A 429 must surface BOTH via alert() (highlighted) and error()
+        (red prefix) so a multi-hour pipeline run can't bury the failure.
+        The message must explicitly say enumeration is INCOMPLETE."""
         inst = self._inst()
         inst.request = lambda *a, **kw: Resp(status=429, text='Too Many Requests')
         inst.module_run(['example.com'])
         self.assertEqual(len(inst._hosts), 0)
-        self.assertTrue(any('Rate limit' in e for e in inst._errors))
+        # Hits both channels
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertTrue(any('RATE LIMITED' in a for a in alerts),
+                        msg=f"alerts={alerts!r}")
+        self.assertTrue(any('RATE LIMITED' in e for e in inst._errors),
+                        msg=f"errors={inst._errors!r}")
+        # Mentions affected domain and partial-coverage warning
+        joined = ' '.join(alerts + inst._errors)
+        self.assertIn("'example.com'", joined)
+        self.assertIn('INCOMPLETE', joined)
+
+    def test_rate_limit_429_includes_retry_after(self):
+        """If the upstream sends Retry-After, surface it in the message —
+        helps the operator decide whether to wait or move on."""
+        inst = self._inst()
+        inst.request = lambda *a, **kw: Resp(
+            status=429, text='Too Many Requests',
+            headers={'Retry-After': '3600'},
+        )
+        inst.module_run(['example.com'])
+        joined = ' '.join(o for o in inst._output if o.startswith('ALERT:')) \
+                 + ' ' + ' '.join(inst._errors)
+        self.assertIn('3600', joined)
+        self.assertIn('Retry-After', joined)
 
     def test_null_dns_names_skipped_gracefully(self):
         """Explicit None dns_names (absent expand) should not crash."""
@@ -343,11 +591,84 @@ class TestCertspotter(unittest.TestCase):
         inst.module_run(['example.com'])
         self.assertEqual([h['host'] for h in inst._hosts], ['ok.example.com'])
 
-    def test_wildcard_entries_inserted_as_is(self):
+    def test_wildcard_entries_skipped(self):
+        """Wildcard SAN entries are not real hosts; the apex they cover is
+        already in the domains table, so skip them rather than ingest a
+        literal '*.example.com' string."""
         inst = self._inst()
-        inst.request = self._one_page(self._cert('*.example.com', id='1'))
+        inst.request = self._one_page(
+            self._cert('*.example.com', 'real.example.com', id='1'),
+        )
         inst.module_run(['example.com'])
-        self.assertEqual(inst._hosts[0]['host'], '*.example.com')
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertEqual(hosts, ['real.example.com'])
+
+    # ── multi-tenant cert filtering (Adobe Scene7 / Cloudflare Universal SSL) ─
+    # Regression: certspotter previously ingested every SAN on every returned
+    # cert, so querying starbucks.com leaked SANs like s7.jcrew.com,
+    # s7.sears.com, dam.ey.com from shared certificates.
+
+    def test_off_domain_san_on_shared_cert_dropped(self):
+        inst = self._inst()
+        inst.request = self._one_page(
+            self._cert(
+                's7.example.com',     # the SAN that matched our query
+                's7.jcrew.com',       # unrelated tenants on the same cert
+                's7.madewell.com',
+                'dam.ey.com',
+                id='1',
+            ),
+        )
+        inst.module_run(['example.com'])
+        hosts = [h['host'] for h in inst._hosts]
+        self.assertEqual(hosts, ['s7.example.com'])
+
+    def test_apex_match_kept(self):
+        inst = self._inst()
+        inst.request = self._one_page(self._cert('example.com', id='1'))
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['example.com'])
+
+    def test_lookalike_suffix_not_matched(self):
+        """`evilexample.com` ends with `example.com` byte-suffix-wise but is
+        a different registered domain. Must not match."""
+        inst = self._inst()
+        inst.request = self._one_page(
+            self._cert('evilexample.com', 'mail.evilexample.com', id='1'),
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+
+    def test_match_is_case_insensitive(self):
+        inst = self._inst()
+        inst.request = self._one_page(
+            self._cert('MAIL.Example.COM', id='1'),
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['mail.example.com'])
+
+    def test_email_off_domain_host_skipped(self):
+        """An email SAN whose host part is unrelated to the query domain
+        should not insert a host or a contact."""
+        inst = self._inst()
+        inst.request = self._one_page(
+            self._cert('admin@unrelated.com', 'admin@example.com', id='1'),
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['example.com'])
+        self.assertEqual(
+            [c['email'] for c in inst._contacts],
+            ['admin@example.com'],
+        )
+
+    def test_trailing_dot_in_san_normalised(self):
+        """CT logs sometimes include the trailing root dot. Must still match."""
+        inst = self._inst()
+        inst.request = self._one_page(
+            self._cert('mail.example.com.', id='1'),
+        )
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['mail.example.com'])
 
     def test_multiple_domains_each_queried(self):
         call_count = [0]
