@@ -15,7 +15,7 @@ class Module(BaseModule, ResolverMixin):
     meta = {
         'name': 'Hostname Permutation',
         'author': 'Nicholas Curran (@ncurran)',
-        'version': '1.1',
+        'version': '1.2',
         'description': (
             'Generates common permutations of known hostnames (dev-, staging-, '
             'api-, -2, etc.), resolves each via DNS, and inserts any that return '
@@ -29,8 +29,15 @@ class Module(BaseModule, ResolverMixin):
             'CNAME targets recorded by brute_hosts (e.g. *.cdn.cloudflare.net, '
             '*.outlook.com) are skipped to avoid permuting vendor infrastructure '
             'into the workspace. Add such domains to the domains table to opt in.',
+            'Records provenance chain on each insert (e.g. '
+            '"alienvault.brute_hosts.permute") so it is traceable how each '
+            'permuted host arrived in the workspace.',
         ),
-        'query': 'SELECT DISTINCT host FROM hosts WHERE host IS NOT NULL',
+        # Multi-column query: opt in to provenance tracking. Each input row
+        # arrives as a (host, parent_module, parent_provenance) tuple; permute
+        # extends the chain with its own name on insert.
+        'query': 'SELECT DISTINCT host, module, provenance FROM hosts WHERE host IS NOT NULL',
+        'accepts_provenance': True,
         'options': (
             ('words', ','.join(DEFAULT_WORDS), True, 'comma-separated permutation words'),
         ),
@@ -66,7 +73,8 @@ class Module(BaseModule, ResolverMixin):
             )
         out_of_scope_skipped = 0
 
-        for host in hosts:
+        for host_row in hosts:
+            host, parent_chain = _unpack_provenance_row(host_row)
             host = host.lower()
             if '.' not in host:
                 self.verbose(f"Skipping '{host}' (no subdomain to permute).")
@@ -78,6 +86,11 @@ class Module(BaseModule, ResolverMixin):
 
             leaf, _, rest = host.partition('.')
             self.heading(host, level=0)
+
+            # Compose this insert's provenance: extend the parent chain with
+            # our own module name. If parent had no provenance recorded, this
+            # is the chain root.
+            new_chain = f"{parent_chain}.permute" if parent_chain else 'permute'
 
             candidates = self._candidates(leaf, rest, host, words)
             new_inserted = 0
@@ -100,7 +113,8 @@ class Module(BaseModule, ResolverMixin):
                     if rdata.rdtype == dns.rdatatype.A:
                         address = rdata.address
                         self.alert(f'{candidate} => {address}')
-                        self.insert_hosts(host=candidate, ip_address=address)
+                        self.insert_hosts(host=candidate, ip_address=address,
+                                          provenance=new_chain)
                         new_inserted += 1
 
             self.output(f"{new_inserted} new hosts from permutations of '{host}'.")
@@ -139,3 +153,19 @@ def _in_scope(host, in_scope_domains):
         if h == d or h.endswith('.' + d):
             return True
     return False
+
+
+def _unpack_provenance_row(row):
+    """Normalise an input row that may be either:
+    - a bare value string (no provenance available, e.g. file source), OR
+    - a (value, parent_module, parent_provenance) tuple from a multi-column
+      meta query opted into via 'accepts_provenance'.
+
+    Returns (value, parent_chain) where parent_chain is the parent's
+    provenance if present, else parent's module, else empty string."""
+    if isinstance(row, (tuple, list)):
+        value = row[0] if len(row) > 0 else ''
+        parent_module = row[1] if len(row) > 1 else None
+        parent_provenance = row[2] if len(row) > 2 else None
+        return value, (parent_provenance or parent_module or '')
+    return row, ''

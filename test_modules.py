@@ -61,8 +61,11 @@ class MockBaseModule:
         raise NotImplementedError('patch me')
 
     # inserts ──────────────────────────────────────────────────────────────────
-    def insert_hosts(self, host=None, ip_address=None):
-        self._hosts.append({'host': host, 'ip_address': ip_address})
+    # The public framework's insert_*() methods accept arbitrary trailing
+    # kwargs (notes, mute, provenance, ...). Mock variants accept **kw too
+    # so module authors using new fields don't need a mock-update PR.
+    def insert_hosts(self, host=None, ip_address=None, **kw):
+        self._hosts.append({'host': host, 'ip_address': ip_address, **kw})
 
     def insert_contacts(self, **kw):
         self._contacts.append(kw)
@@ -73,14 +76,14 @@ class MockBaseModule:
     def insert_locations(self, **kw):
         self._locations.append(kw)
 
-    def insert_netblocks(self, netblock=None):
-        self._netblocks.append(netblock)
+    def insert_netblocks(self, netblock=None, **kw):
+        self._netblocks.append({'netblock': netblock, **kw} if kw else netblock)
 
     def insert_ports(self, **kw):
         self._ports.append(kw)
 
-    def insert_domains(self, domain=None):
-        self._domains.append(domain)
+    def insert_domains(self, domain=None, **kw):
+        self._domains.append({'domain': domain, **kw} if kw else domain)
 
     def insert_vulnerabilities(self, **kw):
         self._vulnerabilities.append(kw)
@@ -2349,6 +2352,51 @@ class TestPermute(unittest.TestCase):
         # Loud warning fires
         self.assertTrue(any('Scope filter DISABLED' in e for e in inst._errors),
                         msg=f"errors: {inst._errors}")
+
+    # ── provenance chain composition (Phase 2 pilot opt-in)
+
+    def test_provenance_chain_extends_parent_provenance(self):
+        """When the input row carries a parent provenance string, permute
+        appends '.permute' to it on each insert."""
+        inst = self._inst(words='dev')
+        inst._query_responses = {
+            'SELECT domain FROM domains': [('example.com',)],
+        }
+        resolver = _FakeResolver({'dev.www.example.com': ['10.0.0.1']})
+        inst.get_resolver = lambda: resolver
+        # Multi-column input row: (host, parent_module, parent_provenance)
+        inst.module_run([('www.example.com', 'brute_hosts', 'alienvault.brute_hosts')])
+        hosts = [h for h in inst._hosts if h['host'] == 'dev.www.example.com']
+        self.assertEqual(len(hosts), 1)
+        self.assertEqual(hosts[0]['provenance'], 'alienvault.brute_hosts.permute')
+
+    def test_provenance_falls_back_to_parent_module_when_no_provenance(self):
+        """If the parent row had a module set but no provenance recorded
+        (a non-opt-in module produced the host), permute uses the module
+        name as the chain root."""
+        inst = self._inst(words='dev')
+        inst._query_responses = {
+            'SELECT domain FROM domains': [('example.com',)],
+        }
+        resolver = _FakeResolver({'dev.www.example.com': ['10.0.0.1']})
+        inst.get_resolver = lambda: resolver
+        # Provenance is None — only module is known
+        inst.module_run([('www.example.com', 'certspotter', None)])
+        hosts = [h for h in inst._hosts if h['host'] == 'dev.www.example.com']
+        self.assertEqual(hosts[0]['provenance'], 'certspotter.permute')
+
+    def test_provenance_root_when_input_has_no_parent_info(self):
+        """Bare-string input (file source, etc.) has no parent provenance.
+        The chain root is just 'permute'."""
+        inst = self._inst(words='dev')
+        inst._query_responses = {
+            'SELECT domain FROM domains': [('example.com',)],
+        }
+        resolver = _FakeResolver({'dev.www.example.com': ['10.0.0.1']})
+        inst.get_resolver = lambda: resolver
+        inst.module_run(['www.example.com'])
+        hosts = [h for h in inst._hosts if h['host'] == 'dev.www.example.com']
+        self.assertEqual(hosts[0]['provenance'], 'permute')
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
