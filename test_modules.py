@@ -2688,6 +2688,164 @@ class TestSubdomainCenter(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# shodan_ct (ctl.shodan.io — free CT log mirror, no API key, no credits)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _ShodanCTResp:
+    """Mock for ctl.shodan.io /hostnames: status, headers, json() -> list or raise."""
+    def __init__(self, status=200, payload=None, headers=None, json_raises=False):
+        self.status_code = status
+        self.headers = headers or {}
+        self._payload = payload if payload is not None else []
+        self._raises = json_raises
+
+    def json(self):
+        if self._raises:
+            raise ValueError('not JSON')
+        return self._payload
+
+
+class TestShodanCT(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.file = load_mod(_p('recon', 'domains-hosts', 'shodan_ct.py'))
+
+    def _inst(self):
+        return self.file.Module()
+
+    def test_hits_hostnames_endpoint_no_key(self):
+        """Must call the keyless ctl.shodan.io /hostnames endpoint — never the
+        metered api.shodan.io and never with an API key/credit param."""
+        captured = []
+        inst = self._inst()
+        def _req(method, url, **kw):
+            captured.append(url)
+            return _ShodanCTResp(payload=['api.example.com'])
+        inst.request = _req
+        inst.module_run(['example.com'])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            captured[0],
+            'https://ctl.shodan.io/api/v1/domain/example.com/hostnames',
+        )
+        self.assertNotIn('api.shodan.io', captured[0])
+        self.assertNotIn('key=', captured[0])
+
+    def test_happy_path_inserts_filtered_hosts(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _ShodanCTResp(payload=[
+            'mail.example.com', 'api.example.com', 'orphan.unrelated.com',
+            '*.example.com', 'WWW.Example.COM', 'evilexample.com',
+        ])
+        inst.module_run(['example.com'])
+        hosts = sorted(h['host'] for h in inst._hosts)
+        # off-domain dropped, wildcard skipped, lookalike rejected, casing normalised
+        self.assertEqual(hosts, ['api.example.com', 'mail.example.com', 'www.example.com'])
+
+    def test_apex_itself_included(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _ShodanCTResp(payload=['example.com'])
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['example.com'])
+
+    def test_trailing_dot_normalised(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _ShodanCTResp(payload=['api.example.com.'])
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['api.example.com'])
+
+    def test_429_disables_source_for_remaining_domains(self):
+        inst = self._inst()
+        calls = []
+        def _req(method, url, **kw):
+            calls.append(url)
+            return _ShodanCTResp(status=429, headers={'Retry-After': '60'})
+        inst.request = _req
+        inst.module_run(['a.example', 'b.example', 'c.example'])
+        self.assertEqual(len(calls), 1, msg=f"calls: {calls}")
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertEqual(len(alerts), 1, msg=f"alerts: {alerts}")
+        joined = ' '.join(alerts + inst._errors)
+        self.assertIn('UPSTREAM ERROR', joined)
+        self.assertIn('429', joined)
+        self.assertIn('60', joined)
+        self.assertIn('rest of this run', joined)
+
+    def test_5xx_and_cloudflare_origin_codes_disable_source(self):
+        for code in (502, 503, 504, 521, 522, 523, 524):
+            with self.subTest(code=code):
+                inst = self._inst()
+                calls = [0]
+                def _req(method, url, _c=code, **kw):
+                    calls[0] += 1
+                    return _ShodanCTResp(status=_c)
+                inst.request = _req
+                inst.module_run(['a.example', 'b.example', 'c.example'])
+                self.assertEqual(calls[0], 1)
+                joined = ' '.join(inst._output) + ' ' + ' '.join(inst._errors)
+                self.assertIn('UPSTREAM ERROR', joined)
+                self.assertIn(str(code), joined)
+
+    def test_request_exception_disables_source(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(method, url, **kw):
+            calls[0] += 1
+            raise ConnectionError('connect refused')
+        inst.request = _req
+        inst.module_run(['a.example', 'b.example'])
+        self.assertEqual(calls[0], 1)
+        joined = ' '.join(inst._output) + ' ' + ' '.join(inst._errors)
+        self.assertIn('UPSTREAM ERROR', joined)
+        self.assertIn('ConnectionError', joined)
+
+    def test_non_200_4xx_continues_without_disabling(self):
+        inst = self._inst()
+        calls = [0]
+        def _req(method, url, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                return _ShodanCTResp(status=404)
+            return _ShodanCTResp(payload=['ok.example'])
+        inst.request = _req
+        inst.module_run(['first.example', 'second.example'])
+        self.assertEqual(calls[0], 2)
+        alerts = [o for o in inst._output if o.startswith('ALERT:')]
+        self.assertEqual(alerts, [])
+
+    def test_non_json_body_does_not_crash(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _ShodanCTResp(status=200, json_raises=True)
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+        self.assertTrue(any('Non-JSON' in e for e in inst._errors))
+
+    def test_unexpected_response_shape_handled(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _ShodanCTResp(payload={'hostnames': ['ok.example.com']})
+        inst.module_run(['example.com'])
+        self.assertEqual(inst._hosts, [])
+        self.assertTrue(any('expected list' in e for e in inst._errors))
+
+    def test_non_string_entries_skipped(self):
+        inst = self._inst()
+        inst.request = lambda *a, **kw: _ShodanCTResp(payload=['api.example.com', None, 42])
+        inst.module_run(['example.com'])
+        self.assertEqual([h['host'] for h in inst._hosts], ['api.example.com'])
+
+    def test_multiple_domains_each_queried(self):
+        seen = []
+        inst = self._inst()
+        def _req(method, url, **kw):
+            seen.append(url)
+            return _ShodanCTResp(payload=[])
+        inst.request = _req
+        inst.module_run(['one.example', 'two.example'])
+        self.assertEqual(len(seen), 2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Fail-fast retrofit regression tests for the two existing CT modules
 # ═══════════════════════════════════════════════════════════════════════════════
 
