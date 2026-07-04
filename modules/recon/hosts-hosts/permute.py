@@ -2,6 +2,8 @@ from recon.core.module import BaseModule
 from recon.mixins.resolver import ResolverMixin
 import dns.rdatatype
 import dns.resolver
+import random
+import string
 
 
 DEFAULT_WORDS = [
@@ -9,22 +11,47 @@ DEFAULT_WORDS = [
     'api', 'admin', 'auth', 'beta', 'internal', 'mail', 'ftp', 'vpn',
 ]
 
+# How many random non-existent labels to resolve when establishing a zone's
+# wildcard baseline. >1 catches round-robin / GeoDNS wildcards that rotate IPs.
+WILDCARD_PROBES = 3
+
+# Hard backstop: if a single run inserts more than this, something has defeated
+# the wildcard guard (e.g. a wildcard that rotates more IPs than we sampled).
+# Stop loudly rather than blow the workspace/log up to tens of thousands of
+# junk hosts (the 2026-06 flutteruki/wells_fargo blowups: 38k hosts, 58 GB log).
+MAX_INSERTS_PER_RUN = 4000
+
 
 class Module(BaseModule, ResolverMixin):
 
     meta = {
         'name': 'Hostname Permutation',
         'author': 'Nicholas Curran (@ncurran)',
-        'version': '1.2',
+        'version': '1.3',
         'description': (
             'Generates common permutations of known hostnames (dev-, staging-, '
             'api-, -2, etc.), resolves each via DNS, and inserts any that return '
-            'an A record into the hosts table. Equivalent to altdns/alterx.'
+            'an A record into the hosts table. Equivalent to altdns/alterx. '
+            'Wildcard-DNS aware: establishes each zone\'s wildcard baseline first '
+            'and drops permutations that merely resolve to the wildcard (which '
+            'are not real distinct hosts) — preventing combinatorial blowup on '
+            'wildcard apexes.'
         ),
         'comments': (
             'Uses the leftmost label of each host as the permutation seed.',
             'Patterns: insertion (word.host), prefix (word-leaf.rest), '
             'suffix (leaf-word.rest), and numeric suffix (leaf1, leaf2, leaf3).',
+            'WILDCARD GUARD: for each candidate, the parent zone is probed with '
+            f'{WILDCARD_PROBES} random non-existent labels to learn its wildcard '
+            'A-record baseline (cached per zone). A candidate whose every A '
+            'record is in that baseline is a wildcard catch — NOT a real host — '
+            'and is dropped. Without this, a wildcard apex (*.acme.com -> fixed '
+            'IP) makes every permutation "resolve" and inserts tens of thousands '
+            'of junk hosts (root cause of the 2026-06 38k-host / 58 GB-log '
+            'blowups).',
+            f'A hard insert cap ({MAX_INSERTS_PER_RUN}/run) is a backstop in case '
+            'a rotating wildcard defeats the baseline sample — the run stops loud '
+            'rather than runaway.',
             'Only fans out from hosts whose root is in the domains table — '
             'CNAME targets recorded by brute_hosts (e.g. *.cdn.cloudflare.net, '
             '*.outlook.com) are skipped to avoid permuting vendor infrastructure '
@@ -47,6 +74,8 @@ class Module(BaseModule, ResolverMixin):
         words = [w.strip().lower() for w in self.options['words'].split(',') if w.strip()]
         resolver = self.get_resolver()
         seen = set()
+        wildcard_cache = {}   # parent zone -> frozenset(baseline A IPs); empty = no wildcard
+        total_inserted = 0
 
         # Scope filter: only fan out from hosts under a known in-scope domain.
         # brute_hosts records CNAME targets as separate hosts (e.g. cloudflare,
@@ -72,6 +101,7 @@ class Module(BaseModule, ResolverMixin):
                 "brute_hosts (cloudflare, akamai, outlook, q4web, etc.)."
             )
         out_of_scope_skipped = 0
+        wildcard_dropped = 0
 
         for host_row in hosts:
             host, parent_chain = _unpack_provenance_row(host_row)
@@ -109,13 +139,43 @@ class Module(BaseModule, ResolverMixin):
                     self.verbose(f'{candidate} => DNS error')
                     continue
 
-                for rdata in answers:
-                    if rdata.rdtype == dns.rdatatype.A:
-                        address = rdata.address
-                        self.alert(f'{candidate} => {address}')
-                        self.insert_hosts(host=candidate, ip_address=address,
-                                          provenance=new_chain)
-                        new_inserted += 1
+                a_ips = [r.address for r in answers if r.rdtype == dns.rdatatype.A]
+                if not a_ips:
+                    continue
+
+                # WILDCARD GUARD — the core fix. Establish the candidate's parent
+                # zone's wildcard baseline (cached) and drop the candidate if all
+                # of its A records are merely the wildcard's IPs: it doesn't exist
+                # as a distinct host, it was just caught by *.<parent>.
+                parent_zone = candidate.split('.', 1)[1] if '.' in candidate else candidate
+                baseline = self._wildcard_baseline(resolver, parent_zone, wildcard_cache)
+                if baseline and all(ip in baseline for ip in a_ips):
+                    self.verbose(
+                        f'{candidate} => {a_ips} (wildcard catch on *.{parent_zone}, dropped)'
+                    )
+                    wildcard_dropped += 1
+                    continue
+
+                for ip in a_ips:
+                    self.alert(f'{candidate} => {ip}')
+                    self.insert_hosts(host=candidate, ip_address=ip,
+                                      provenance=new_chain)
+                    new_inserted += 1
+                    total_inserted += 1
+
+                if total_inserted >= MAX_INSERTS_PER_RUN:
+                    self.error(
+                        f"permute insert cap ({MAX_INSERTS_PER_RUN}) hit — stopping. "
+                        f"A wildcard zone likely rotates more IPs than the "
+                        f"{WILDCARD_PROBES}-probe baseline sampled. Inspect the "
+                        f"hosts table for a dominant IP and exclude permute-"
+                        f"provenance hosts on that apex."
+                    )
+                    self.output(
+                        f"Stopped early: {total_inserted} inserts, "
+                        f"{wildcard_dropped} wildcard-dropped."
+                    )
+                    return
 
             self.output(f"{new_inserted} new hosts from permutations of '{host}'.")
 
@@ -125,6 +185,40 @@ class Module(BaseModule, ResolverMixin):
                 f"domains (CNAME targets / vendor infra). Add those domains to "
                 f"the domains table if you want them permuted."
             )
+        if wildcard_dropped:
+            self.output(
+                f"Dropped {wildcard_dropped} wildcard-catch permutation(s) "
+                f"(resolved only to a *.<zone> wildcard baseline — not real hosts)."
+            )
+
+    def _wildcard_baseline(self, resolver, zone, cache):
+        """Return the frozenset of A IPs that a *.<zone> wildcard serves, or an
+        empty frozenset if the zone has no wildcard. Cached per zone.
+
+        Resolves WILDCARD_PROBES random, almost-certainly-nonexistent labels
+        under the zone. If they return A records, the zone wildcards and those
+        IPs are the baseline that real permutations must differ from."""
+        if zone in cache:
+            return cache[zone]
+        ips = set()
+        for _ in range(WILDCARD_PROBES):
+            label = 'wc' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
+            probe = f'{label}.{zone}'
+            try:
+                answers = resolver.query(probe)
+                ips.update(r.address for r in answers if r.rdtype == dns.rdatatype.A)
+            except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+                pass
+            except (dns.resolver.NoNameservers, dns.resolver.Timeout):
+                pass
+        baseline = frozenset(ips)
+        cache[zone] = baseline
+        if baseline:
+            self.alert(
+                f"  ↳ wildcard DNS on *.{zone} (baseline {sorted(baseline)}) "
+                f"— permutations resolving only to it are dropped"
+            )
+        return baseline
 
     @staticmethod
     def _candidates(leaf, rest, host, words):
